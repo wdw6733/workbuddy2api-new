@@ -4223,8 +4223,23 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         <div style="font-size:12px;color:var(--dim);margin-bottom:4px">API Key</div>
         <input id="stationEditKey" class="slot-input" style="margin-bottom:12px" placeholder="sk-...（编辑时留空则保留原值）">
         <div style="font-size:12px;color:var(--dim);margin-bottom:4px">签到地址（可选）</div>
-        <input id="stationEditCheckin" class="slot-input" style="margin-bottom:6px" placeholder="https://example.com/api/checkin">
-        <div class="hint" style="margin:0 0 12px">各公益站签到接口不同，填该站自己的签到链接后，网关会每天 08:00 自动调用一次。</div>
+        <input id="stationEditCheckin" class="slot-input" style="margin-bottom:6px" placeholder="https://example.com/api/user/check_in">
+        <div class="hint" style="margin:0 0 12px">New API 系站点一般为 /api/user/check_in（POST）。用 F12 → Network 点签到按钮可抓到真实接口。</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+          <div style="flex:0 0 110px">
+            <div style="font-size:12px;color:var(--dim);margin-bottom:4px">签到方法</div>
+            <select id="stationEditCheckinMethod" class="slot-select" style="width:100%">
+              <option value="GET">GET</option>
+              <option value="POST">POST</option>
+            </select>
+          </div>
+          <div style="flex:1;min-width:150px">
+            <div style="font-size:12px;color:var(--dim);margin-bottom:4px">用户 ID（New-Api-User，可选）</div>
+            <input id="stationEditCheckinUid" class="slot-input" placeholder="例如 100892">
+          </div>
+        </div>
+        <div style="font-size:12px;color:var(--dim);margin-bottom:4px">系统访问令牌（可选，站点个人设置里生成）</div>
+        <input id="stationEditCheckinToken" class="slot-input" style="margin-bottom:12px" placeholder="留空则用站点 API Key">
         <div style="font-size:12px;color:var(--dim);margin-bottom:4px">优先级（越小越优先，故障转移顺序）</div>
         <input id="stationEditPriority" type="number" class="slot-input" style="margin-bottom:12px" value="0" min="0" step="1">
         <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
@@ -14873,6 +14888,9 @@ function openStationEdit(id){
   document.getElementById('stationEditUrl').value = st ? (st.base_url || '') : '';
   document.getElementById('stationEditKey').value = '';
   document.getElementById('stationEditCheckin').value = st ? (st.checkin_url || '') : '';
+  document.getElementById('stationEditCheckinMethod').value = st ? (st.checkin_method || 'GET') : 'GET';
+  document.getElementById('stationEditCheckinUid').value = st ? (st.checkin_user_id || '') : '';
+  document.getElementById('stationEditCheckinToken').value = '';
   document.getElementById('stationEditPriority').value = st ? (st.priority != null ? st.priority : 0) : 0;
   document.getElementById('stationEditEnabled').checked = st ? !!st.enabled : true;
   document.getElementById('stationEditModal').classList.add('show');
@@ -14887,13 +14905,18 @@ async function saveStation(){
   const url = document.getElementById('stationEditUrl').value.trim();
   const key = document.getElementById('stationEditKey').value.trim();
   const checkin = document.getElementById('stationEditCheckin').value.trim();
+  const checkinMethod = document.getElementById('stationEditCheckinMethod').value;
+  const checkinUid = document.getElementById('stationEditCheckinUid').value.trim();
+  const checkinToken = document.getElementById('stationEditCheckinToken').value.trim();
   const priority = parseInt(document.getElementById('stationEditPriority').value, 10);
   const enabled = document.getElementById('stationEditEnabled').checked;
   if(!name || !url){ toast('站点名称和接口地址不能为空', 'bad'); return; }
   try {
-    const body = { id: id, name: name, base_url: url, enabled: enabled };
+    const body = { id: id, name: name, base_url: url, enabled: enabled,
+                   checkin_method: checkinMethod, checkin_user_id: checkinUid };
     if(key) body.api_key = key;
     if(checkin) body.checkin_url = checkin;
+    if(checkinToken) body.checkin_token = checkinToken;
     if(!isNaN(priority)) body.priority = priority;
     await postJSON('/stations/save', body);
     closeStationEdit();

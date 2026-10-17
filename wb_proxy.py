@@ -16756,6 +16756,9 @@ class Handler(BaseHTTPRequestHandler):
             base_url = str(payload.get("base_url") or "").strip()
             api_key = str(payload.get("api_key") or "").strip()
             checkin_url = str(payload.get("checkin_url") or "").strip()
+            checkin_method = payload.get("checkin_method")
+            checkin_token = payload.get("checkin_token")
+            checkin_user_id = payload.get("checkin_user_id")
             enabled = payload.get("enabled")
             if enabled is not None:
                 enabled = bool(enabled)
@@ -16767,12 +16770,20 @@ class Handler(BaseHTTPRequestHandler):
                 st = wb_stations.update_station(
                     st_id, name=name, base_url=base_url,
                     api_key=api_key or None, enabled=enabled,
-                    checkin_url=checkin_url or None, priority=priority)
+                    checkin_url=checkin_url or None, priority=priority,
+                    checkin_method=checkin_method,
+                    checkin_token=checkin_token,
+                    checkin_user_id=checkin_user_id)
                 if not st:
                     return self._error(404, "station not found", "invalid_request_error")
             else:
                 st = wb_stations.add_station(name, base_url, api_key, enabled=enabled,
                                              priority=priority, checkin_url=checkin_url)
+                if checkin_method:
+                    st = wb_stations.update_station(
+                        st["id"], checkin_method=checkin_method,
+                        checkin_token=checkin_token,
+                        checkin_user_id=checkin_user_id) or st
             wb_stations.probe_one_async(st["id"])
             wb_stations.fetch_balance_all_async()
             return self._json(200, {"ok": True, "station": st})

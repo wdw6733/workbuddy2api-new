@@ -109,6 +109,9 @@ def add_station(name, base_url, api_key, enabled=True, priority=0, checkin_url="
         "api_key": str(api_key or "").strip(),
         "enabled": bool(enabled),
         "checkin_url": str(checkin_url or "").strip(),
+        "checkin_method": "GET",
+        "checkin_token": "",
+        "checkin_user_id": "",
         "priority": priority,
         "models_selected": [],
         "models_all": [],
@@ -122,7 +125,8 @@ def add_station(name, base_url, api_key, enabled=True, priority=0, checkin_url="
 
 
 def update_station(st_id, name=None, base_url=None, api_key=None, enabled=None,
-                   checkin_url=None, priority=None):
+                   checkin_url=None, priority=None, checkin_method=None,
+                   checkin_token=None, checkin_user_id=None):
     """更新站点；api_key 传 None 或空串表示保留原值。返回更新后的站点或 None。"""
     with _LOCK:
         st = _find(st_id)
@@ -146,6 +150,13 @@ def update_station(st_id, name=None, base_url=None, api_key=None, enabled=None,
             if new_url != str(st.get("checkin_url") or "").strip():
                 st["checkin_url"] = new_url
                 st.pop("last_checkin", None)
+        if checkin_method is not None:
+            m = str(checkin_method).strip().upper()
+            st["checkin_method"] = m if m in ("GET", "POST") else "GET"
+        if checkin_token is not None and str(checkin_token).strip():
+            st["checkin_token"] = str(checkin_token).strip()
+        if checkin_user_id is not None:
+            st["checkin_user_id"] = str(checkin_user_id).strip()
         # 地址或密钥变了，旧测活结果不再可信
         st["status"] = _station_default_status()
         st["models_all"] = []
@@ -478,6 +489,7 @@ def view():
             item = json.loads(json.dumps(st))
             item["api_key_masked"] = _mask_key(st.get("api_key"))
             item.pop("api_key", None)
+            item.pop("checkin_token", None)
             status = st.get("status") or {}
             state = status.get("state") or "unknown"
             selected = len(st.get("models_selected") or [])
@@ -509,6 +521,9 @@ def view():
                             pass
             item["note"] = note
             item["checkin_url"] = st.get("checkin_url") or ""
+            item["checkin_method"] = st.get("checkin_method") or "GET"
+            item["checkin_token_set"] = bool(str(st.get("checkin_token") or "").strip())
+            item["checkin_user_id"] = st.get("checkin_user_id") or ""
             item["last_checkin"] = st.get("last_checkin")
             out.append(item)
         return out
@@ -567,10 +582,7 @@ def fetch_balance(st_id):
         return (False, None)
     t0 = time.time()
     try:
-        headers = {"Accept": "application/json"}
-        key = snap.get("api_key") or ""
-        if key:
-            headers["Authorization"] = "Bearer " + key
+        headers = _user_api_headers(snap)
         req = urllib.request.Request(_balance_url(snap), headers=headers, method="GET")
         with urllib.request.urlopen(req, timeout=BALANCE_TIMEOUT) as resp:
             body = resp.read(512 * 1024).decode("utf-8", "replace")
@@ -632,8 +644,25 @@ def set_checkin_url(st_id, checkin_url):
         return st
 
 
+def _user_api_headers(st):
+    """用户级接口（签到/余额）的请求头。
+
+    New API / One API 系站点的 /api/user/* 需要「系统访问令牌」（个人设置里
+    生成，非 sk- API Key）+ New-Api-User: <用户ID> 头。令牌优先取站点配置的
+    checkin_token，没有则回退 api_key（兼容少数用 API Key 鉴权的站）。
+    """
+    headers = {"Accept": "application/json"}
+    token = str(st.get("checkin_token") or "").strip() or str(st.get("api_key") or "").strip()
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    uid = str(st.get("checkin_user_id") or "").strip()
+    if uid:
+        headers["New-Api-User"] = uid
+    return headers
+
+
 def checkin(st_id):
-    """调用站点配置的签到接口（GET + Bearer 鉴权）。返回 (ok, message)。"""
+    """调用站点配置的签到接口（方法/令牌/用户ID 均可配）。返回 (ok, message)。"""
     with _LOCK:
         st = _find(st_id)
         snap = json.loads(json.dumps(st)) if st else None
@@ -642,12 +671,15 @@ def checkin(st_id):
     url = str(snap.get("checkin_url") or "").strip()
     if not url:
         return (False, "未配置签到地址")
+    method = str(snap.get("checkin_method") or "GET").upper()
+    if method not in ("GET", "POST"):
+        method = "GET"
     try:
-        headers = {"Accept": "application/json"}
-        key = snap.get("api_key") or ""
-        if key:
-            headers["Authorization"] = "Bearer " + key
-        req = urllib.request.Request(url, headers=headers, method="GET")
+        headers = _user_api_headers(snap)
+        data = b"{}" if method == "POST" else None
+        if method == "POST":
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
         with urllib.request.urlopen(req, timeout=BALANCE_TIMEOUT) as resp:
             body = resp.read(256 * 1024).decode("utf-8", "replace")
         msg = body[:200]
