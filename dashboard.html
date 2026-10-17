@@ -4188,7 +4188,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         <button class="primary" onclick="openStationEdit()">+ 添加站点</button>
         <button class="sec" onclick="probeStationsAll()">全部测活</button>
         <button class="sec" onclick="loadStations(true)">刷新</button>
-        <span style="align-self:center;font-size:12px;color:var(--dim)" id="stationsHint">模型名冲突时自动加 @站点名 后缀区分。</span>
+        <span style="align-self:center;font-size:12px;color:var(--dim)" id="stationsHint">同名模型自动合并；多站共享时按「优先级 + 延迟」选站，失败自动切换。</span>
       </div>
       <div style="overflow-x:auto">
         <table class="data-table" style="width:100%;margin:0;border-collapse:collapse;font-size:12px">
@@ -4225,6 +4225,8 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         <div style="font-size:12px;color:var(--dim);margin-bottom:4px">签到地址（可选）</div>
         <input id="stationEditCheckin" class="slot-input" style="margin-bottom:6px" placeholder="https://example.com/api/checkin">
         <div class="hint" style="margin:0 0 12px">各公益站签到接口不同，填该站自己的签到链接后，网关会每天 08:00 自动调用一次。</div>
+        <div style="font-size:12px;color:var(--dim);margin-bottom:4px">优先级（越小越优先，故障转移顺序）</div>
+        <input id="stationEditPriority" type="number" class="slot-input" style="margin-bottom:12px" value="0" min="0" step="1">
         <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
           <input type="checkbox" id="stationEditEnabled" checked style="margin:0"> 启用该站点
         </label>
@@ -14825,16 +14827,26 @@ function renderStations(){
     tbody.innerHTML = '<tr><td colspan="5" style="color:var(--dim);text-align:center;padding:22px">还没有站点，点击「添加站点」接入第一个公益站。</td></tr>';
     return;
   }
+  // 统计每个模型被多少个站勾选，用于提示「多站共享可自动故障转移」
+  const shareCount = {};
+  STATIONS_DATA.forEach(function(s){
+    (s.models_selected || []).forEach(function(m){ shareCount[m] = (shareCount[m] || 0) + 1; });
+  });
   let html = '';
   STATIONS_DATA.forEach(function(st){
     const url = st.base_url || '';
+    const pri = (st.priority != null) ? st.priority : 0;
+    const shared = (st.models_selected || []).filter(function(m){ return shareCount[m] > 1; }).length;
+    let note = st.note || '';
+    if(shared > 0){ note += '｜' + shared + ' 个模型多站共享（自动故障转移）'; }
     html += '<tr>' +
-      '<td><div style="font-weight:600">' + esc(st.name) + '</div>' +
+      '<td><div style="font-weight:600">' + esc(st.name) +
+          ' <span style="font-weight:400;color:var(--dim);font-size:11px">优先级 ' + pri + '</span></div>' +
           '<div style="color:var(--dim);font-size:11px;word-break:break-all">' + esc(url) + '</div>' +
           (st.enabled ? '' : '<span style="color:var(--warn,#d97706);font-size:11px">（已停用）</span>') + '</td>' +
       '<td>' + stationStateBadge(st) + '</td>' +
       '<td>' + stationLatency(st) + '</td>' +
-      '<td style="max-width:280px">' + esc(st.note || '') + '</td>' +
+      '<td style="max-width:300px">' + esc(note) + '</td>' +
       '<td><div style="display:flex;gap:6px;flex-wrap:wrap">' +
         '<button class="sec mini" onclick="probeStation(\'' + st.id + '\')">测活</button>' +
         '<button class="sec mini" onclick="openStationModels(\'' + st.id + '\')">选模型</button>' +
@@ -14861,6 +14873,7 @@ function openStationEdit(id){
   document.getElementById('stationEditUrl').value = st ? (st.base_url || '') : '';
   document.getElementById('stationEditKey').value = '';
   document.getElementById('stationEditCheckin').value = st ? (st.checkin_url || '') : '';
+  document.getElementById('stationEditPriority').value = st ? (st.priority != null ? st.priority : 0) : 0;
   document.getElementById('stationEditEnabled').checked = st ? !!st.enabled : true;
   document.getElementById('stationEditModal').classList.add('show');
 }
@@ -14874,12 +14887,14 @@ async function saveStation(){
   const url = document.getElementById('stationEditUrl').value.trim();
   const key = document.getElementById('stationEditKey').value.trim();
   const checkin = document.getElementById('stationEditCheckin').value.trim();
+  const priority = parseInt(document.getElementById('stationEditPriority').value, 10);
   const enabled = document.getElementById('stationEditEnabled').checked;
   if(!name || !url){ toast('站点名称和接口地址不能为空', 'bad'); return; }
   try {
     const body = { id: id, name: name, base_url: url, enabled: enabled };
     if(key) body.api_key = key;
     if(checkin) body.checkin_url = checkin;
+    if(!isNaN(priority)) body.priority = priority;
     await postJSON('/stations/save', body);
     closeStationEdit();
     toast('已保存，正在测活…', 'ok');

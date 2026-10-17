@@ -26,8 +26,12 @@ _LOCK = threading.Lock()
 _STATIONS = []          # 内存态站点清单（含 api_key 明文）
 _STATIONS_FILE = None   # accounts/stations.json 路径
 _LOG = None             # 日志函数（wb_proxy.log）
-# 模型名 -> (站点 id, 真实模型名) 的路由表；勾选/测活后重建
+# 暴露模型名 -> [(站点 id, 真实模型名), ...] 候选列表；勾选/测活后重建。
+# 同名模型自动合并：裸模型 ID 的候选覆盖所有提供它的启用站点，故障转移按此切换。
 _ROUTE_TABLE = {}
+# 失败冷却：站点 id -> 最近失败时间戳。冷却期内该站不参与路由。
+_COOLING = {}
+_COOLDOWN_SECONDS = int(os.environ.get("WB_STATIONS_COOLDOWN", "60"))
 
 
 def init(accounts_dir, log=None):
@@ -92,15 +96,20 @@ def _station_default_status():
     return {"state": "unknown", "latency_ms": None, "detail": "", "checked_at": None}
 
 
-def add_station(name, base_url, api_key, enabled=True):
+def add_station(name, base_url, api_key, enabled=True, priority=0, checkin_url=""):
     """新增站点；返回站点 dict。base_url 建议 .../v1 结尾（也兼容根地址）。"""
+    try:
+        priority = int(priority)
+    except Exception:
+        priority = 0
     st = {
         "id": _new_id(),
         "name": str(name or "").strip() or "未命名站点",
         "base_url": _norm_base_url(base_url),
         "api_key": str(api_key or "").strip(),
         "enabled": bool(enabled),
-        "checkin_url": "",
+        "checkin_url": str(checkin_url or "").strip(),
+        "priority": priority,
         "models_selected": [],
         "models_all": [],
         "status": _station_default_status(),
@@ -113,7 +122,7 @@ def add_station(name, base_url, api_key, enabled=True):
 
 
 def update_station(st_id, name=None, base_url=None, api_key=None, enabled=None,
-                   checkin_url=None):
+                   checkin_url=None, priority=None):
     """更新站点；api_key 传 None 或空串表示保留原值。返回更新后的站点或 None。"""
     with _LOCK:
         st = _find(st_id)
@@ -127,6 +136,11 @@ def update_station(st_id, name=None, base_url=None, api_key=None, enabled=None,
             st["api_key"] = str(api_key).strip()
         if enabled is not None:
             st["enabled"] = bool(enabled)
+        if priority is not None:
+            try:
+                st["priority"] = int(priority)
+            except Exception:
+                st["priority"] = 0
         if checkin_url is not None:
             new_url = str(checkin_url).strip()
             if new_url != str(st.get("checkin_url") or "").strip():
@@ -225,6 +239,8 @@ def probe(st_id):
         }
         if state == "ok":
             st["models_all"] = models
+            # 测活通过说明站点已恢复，清除它的失败冷却
+            clear_cooling(st_id)
             # 新发现的模型不自动勾选；仅当用户从未勾选过时提示在面板上选
         save()
         _rebuild_routes()
@@ -296,77 +312,148 @@ def probe_one_async(st_id):
 # ---- 模型聚合与路由 --------------------------------------------------
 
 def _rebuild_routes():
-    """重建 聚合模型名 -> (站点, 真实模型名) 路由表。
+    """重建路由表：暴露模型名 -> 候选站点列表。
 
-    命名规则：已启用站点勾选的模型里，模型 ID 全局唯一时直接用模型 ID；
-    有同名冲突的站加后缀 `模型ID@站点名`。完整限定形式 `模型ID@站点名`
-    永远可用；裸模型 ID 在唯一时可用。
+    命名规则：
+      - 裸模型 ID：合并所有提供该模型的已启用站点，请求时按「优先级 + 延迟」
+        自动选一个，失败自动切换到下一个（故障转移）。
+      - `模型ID@站点名`：强制指定某个站点（调试/绕开故障站时用）。
     """
     global _ROUTE_TABLE
     table = {}
-    # 先收集所有已启用站点的勾选模型
-    per_station = []
+    by_model = {}
     for st in _STATIONS:
         if not st.get("enabled"):
             continue
         for mid in st.get("models_selected") or []:
-            per_station.append((mid, st))
-    # 统计同名冲突
-    counts = {}
-    for mid, _st in per_station:
-        counts[mid] = counts.get(mid, 0) + 1
-    for mid, st in per_station:
-        if counts.get(mid, 0) > 1:
-            exposed = "%s@%s" % (mid, st.get("name") or st.get("id"))
-        else:
-            exposed = mid
-        table[exposed] = (st.get("id"), mid)
-        # 完整限定名（带 @站点后缀）无论是否冲突都可解析
-        qualified = "%s@%s" % (mid, st.get("name") or st.get("id"))
-        table[qualified] = (st.get("id"), mid)
+            by_model.setdefault(mid, []).append((st["id"], mid))
+    # 裸 ID：合并所有站
+    for mid, cands in by_model.items():
+        table[mid] = list(cands)
+    # @站点名：强制指定
+    for st in _STATIONS:
+        if not st.get("enabled"):
+            continue
+        sname = st.get("name") or st.get("id")
+        for mid in st.get("models_selected") or []:
+            table["%s@%s" % (mid, sname)] = [(st["id"], mid)]
     _ROUTE_TABLE = table
 
 
+def _station_priority(st_id):
+    st = _find(st_id)
+    if not st:
+        return 999
+    try:
+        return int(st.get("priority") or 0)
+    except Exception:
+        return 0
+
+
+def _station_latency(st_id):
+    st = _find(st_id)
+    if not st:
+        return 999999
+    lat = st.get("status", {}).get("latency_ms")
+    return lat if lat is not None else 999999
+
+
+def _station_sort_key(item):
+    st_id, _mid = item
+    return (_station_priority(st_id), _station_latency(st_id))
+
+
+def _is_cooling(st_id):
+    t = _COOLING.get(st_id)
+    if not t:
+        return False
+    return (time.time() - t) < _COOLDOWN_SECONDS
+
+
+def mark_failed(st_id):
+    """记录站点一次失败，进入冷却期（默认 60s，可用 WB_STATIONS_COOLDOWN 调）。"""
+    _COOLING[st_id] = time.time()
+    _logmsg("stations   : 站点 %s 标记失败，冷却 %ds" % (st_id, _COOLDOWN_SECONDS))
+
+
+def clear_cooling(st_id=None):
+    """清除冷却。不传 id 清空全部（测活通过时调用）。"""
+    if st_id:
+        _COOLING.pop(st_id, None)
+    else:
+        _COOLING.clear()
+
+
 def resolve(model):
-    """把下游请求的模型名解析成 (站点 id, 真实模型名)；未命中返回 None。"""
+    """把模型名解析成候选站点列表 [(站点 id, 真实模型名), ...]。
+
+    已按「优先级升序 + 最近测活延迟升序」排序，并排除冷却中的站点。
+    返回空列表表示未命中（或无可用站点）。
+    """
     if not model or not isinstance(model, str):
-        return None
+        return []
+    key = model.strip()
     with _LOCK:
-        hit = _ROUTE_TABLE.get(model.strip())
-        if not hit:
-            return None
-        return hit
+        cands = _ROUTE_TABLE.get(key)
+        if not cands:
+            return []
+        alive = [(s, m) for (s, m) in cands if not _is_cooling(s)]
+        alive.sort(key=_station_sort_key)
+        return alive
 
 
 def models_entries():
-    """构造公益站模型在 /v1/models 里的条目（OpenAI 兼容形状）。"""
+    """构造公益站模型在 /v1/models 里的条目（OpenAI 兼容形状）。
+
+    同名模型合并为单一裸 ID 条目（附 upstreams 列出所有提供站）；
+    `模型ID@站点名` 作为强制指定保留解析能力，但不在列表里列出，
+    避免模型选择器刷出一堆重复项。
+    """
     with _LOCK:
         entries = []
-        for exposed, (st_id, mid) in sorted(_ROUTE_TABLE.items()):
-            st = _find(st_id)
-            if not st:
-                continue
-            meta = None
-            for it in st.get("models_all") or []:
-                if isinstance(it, str) and it == mid:
-                    meta = {}
-                    break
-                if isinstance(it, dict) and it.get("id") == mid:
-                    meta = it
-                    break
-            desc = (meta or {}).get("description") if isinstance(meta, dict) else None
+        for mid in sorted(_ROUTE_TABLE.keys()):
+            if "@" in mid:
+                continue  # @站点 形式不列进模型清单
+            cands = _ROUTE_TABLE[mid]
+            upstreams = []
+            desc = None
+            for st_id, real_mid in cands:
+                st = _find(st_id)
+                if not st:
+                    continue
+                meta = None
+                for it in st.get("models_all") or []:
+                    if isinstance(it, str) and it == real_mid:
+                        meta = {}
+                        break
+                    if isinstance(it, dict) and it.get("id") == real_mid:
+                        meta = it
+                        break
+                if desc is None and isinstance(meta, dict):
+                    desc = meta.get("description")
+                upstreams.append({
+                    "id": st_id,
+                    "name": st.get("name"),
+                    "upstream_model": real_mid,
+                    "priority": _station_priority(st_id),
+                    "state": (st.get("status") or {}).get("state"),
+                    "latency_ms": (st.get("status") or {}).get("latency_ms"),
+                })
+            n = len(upstreams)
+            first = upstreams[0] if upstreams else {}
             entry = {
-                "id": exposed,
+                "id": mid,
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "station",
-                "name": exposed,
-                "description": desc or ("公益站 %s 的模型 %s"
-                                        % (st.get("name"), mid)),
+                "name": mid,
+                "description": desc or ("公益站模型，由 %d 个站点提供" % n),
                 "station": {
-                    "id": st_id,
-                    "name": st.get("name"),
-                    "upstream_model": mid,
+                    "id": first.get("id"),
+                    "name": first.get("name"),
+                    "upstream_model": first.get("upstream_model"),
+                    "providers": n,
+                    "upstreams": upstreams,
                 },
             }
             entries.append(entry)

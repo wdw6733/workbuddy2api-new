@@ -16759,6 +16759,7 @@ class Handler(BaseHTTPRequestHandler):
             enabled = payload.get("enabled")
             if enabled is not None:
                 enabled = bool(enabled)
+            priority = payload.get("priority")
             if not name or not base_url:
                 return self._error(400, "name and base_url are required",
                                    "invalid_request_error")
@@ -16766,13 +16767,12 @@ class Handler(BaseHTTPRequestHandler):
                 st = wb_stations.update_station(
                     st_id, name=name, base_url=base_url,
                     api_key=api_key or None, enabled=enabled,
-                    checkin_url=checkin_url or None)
+                    checkin_url=checkin_url or None, priority=priority)
                 if not st:
                     return self._error(404, "station not found", "invalid_request_error")
             else:
-                st = wb_stations.add_station(name, base_url, api_key, enabled=enabled)
-                if checkin_url:
-                    wb_stations.set_checkin_url(st["id"], checkin_url)
+                st = wb_stations.add_station(name, base_url, api_key, enabled=enabled,
+                                             priority=priority, checkin_url=checkin_url)
             wb_stations.probe_one_async(st["id"])
             wb_stations.fetch_balance_all_async()
             return self._json(200, {"ok": True, "station": st})
@@ -19656,14 +19656,12 @@ class Handler(BaseHTTPRequestHandler):
     def _dispatch_chat_post(self, path, payload):
         # 公益站路由：模型命中勾选的公益站模型时，绕过 WorkBuddy 账号池，
         # 直接转发到对应站点（OpenAI 兼容透传）。
-        station_route = wb_stations.resolve(payload.get("model"))
-        if station_route:
-            if path in ("/v1/responses", "/responses"):
-                return self._error(
-                    400,
-                    "公益站模型暂不支持 Responses API，请改用 /v1/chat/completions",
-                    "invalid_request_error")
-            return self._station_dispatch(path, payload, station_route)
+        # responses 请求走 _handle_responses（内部自己 resolve 并做协议转换），
+        # 这里只拦 chat/completions 与 completions。
+        if path not in ("/v1/responses", "/responses"):
+            station_route = wb_stations.resolve(payload.get("model"))
+            if station_route:
+                return self._station_dispatch(path, payload, station_route)
         # 先挡背景请求：Codex 自己发的（记忆整理／环境建议／自动复核）
         # 不算「使用者实际使用」，一律本地拒绝，不碰上游。
         if BLOCK_BACKGROUND_REQUESTS:
@@ -19759,36 +19757,69 @@ class Handler(BaseHTTPRequestHandler):
             return self._chat_nonstream_response(
                 upstream, model, fp, account, t_start, effort=effort)
 
-    def _station_dispatch(self, path, payload, route):
-        """把命中公益站的请求转发到对应站点（OpenAI 兼容透传）。
+    def _station_open(self, payload, candidates, model, t_start):
+        """按候选顺序打开站点；连接失败 / 5xx / 429 自动切换下一站（故障转移）。
 
-        route = (station_id, real_model)。透传不做协议改写，只换模型名、
-        计用量。流式与非流式都原样回放站点响应。
+        返回 (resp, st_id, real_model)。4xx（参数/密钥问题，换站无用）或全部
+        候选耗尽时，已回错误响应并返回 (None, None, None)。
         """
-        st_id, real_model = route
-        model = payload.get("model") or real_model
+        last_exc = None
+        tried = []
+        for st_id, real_model in candidates:
+            try:
+                resp = wb_stations.open_chat(st_id, real_model, payload)
+                return (resp, st_id, real_model)
+            except urllib.error.HTTPError as exc:
+                if exc.code in (429, 500, 502, 503, 504):
+                    wb_stations.mark_failed(st_id)
+                    last_exc = exc
+                    tried.append("%s(HTTP %d)" % (st_id, exc.code))
+                    log("station-failover: model=%s station=%s HTTP %d -> 切换下一站"
+                        % (model, st_id, exc.code))
+                    continue
+                detail = ""
+                try:
+                    detail = exc.read(600).decode("utf-8", "replace")
+                except Exception:
+                    pass
+                record_error(model, exc.code, "station HTTP %d: %s" % (exc.code, detail[:200]),
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             key=self._key_id())
+                self._error(exc.code, "公益站上游 %d: %s" % (exc.code, detail))
+                return (None, None, None)
+            except Exception as exc:
+                wb_stations.mark_failed(st_id)
+                last_exc = exc
+                tried.append("%s(%s)" % (st_id, str(exc)[:40]))
+                log("station-failover: model=%s station=%s %s -> 切换下一站"
+                    % (model, st_id, str(exc)[:80]))
+                continue
+        # 全部候选耗尽
+        if last_exc is None:
+            message = "无可用公益站"
+        else:
+            message = "公益站全部不可用（已尝试 %s）: %s" % (" → ".join(tried), last_exc)
+        record_error(model, 502, message,
+                     elapsed_ms=int((time.time() - t_start) * 1000),
+                     key=self._key_id())
+        self._error(502, message)
+        return (None, None, None)
+
+    def _station_dispatch(self, path, payload, candidates):
+        """把命中公益站的请求转发到站点（OpenAI 兼容透传 + 故障转移）。
+
+        candidates = [(station_id, real_model), ...]，按优先级排序。透传不做
+        协议改写，只换模型名、计用量。流式与非流式都原样回放站点响应。
+        """
+        model = payload.get("model") or (candidates[0][1] if candidates else "station")
         want_stream = bool(payload.get("stream"))
         t_start = time.time()
-        log("station: model=%s -> station=%s upstream=%s stream=%s key=%s"
-            % (model, st_id, real_model, want_stream,
+        log("station: model=%s candidates=%d stream=%s key=%s"
+            % (model, len(candidates), want_stream,
                key_label(self._key_id()) or "-"))
-        try:
-            resp = wb_stations.open_chat(st_id, real_model, payload)
-        except urllib.error.HTTPError as exc:
-            detail = ""
-            try:
-                detail = exc.read(600).decode("utf-8", "replace")
-            except Exception:
-                pass
-            record_error(model, exc.code, "station HTTP %d: %s" % (exc.code, detail[:200]),
-                         elapsed_ms=int((time.time() - t_start) * 1000),
-                         key=self._key_id())
-            return self._error(exc.code, "公益站上游 %d: %s" % (exc.code, detail))
-        except Exception as exc:
-            record_error(model, 502, str(exc),
-                         elapsed_ms=int((time.time() - t_start) * 1000),
-                         key=self._key_id())
-            return self._error(502, "公益站不可达: %s" % exc)
+        resp, st_id, real_model = self._station_open(payload, candidates, model, t_start)
+        if resp is None:
+            return
         with resp:
             if want_stream:
                 return self._station_stream(resp, model, t_start)
@@ -19858,41 +19889,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, obj)
         return self._json(200, {"raw": body.decode("utf-8", "replace")})
 
-    def _station_open_or_error(self, model, st_id, real_model, chat_req, t_start):
-        """打开站点对话流；失败时记录并回错误响应，返回 None。"""
-        try:
-            return wb_stations.open_chat(st_id, real_model, chat_req)
-        except urllib.error.HTTPError as exc:
-            detail = ""
-            try:
-                detail = exc.read(600).decode("utf-8", "replace")
-            except Exception:
-                pass
-            record_error(model, exc.code, "station HTTP %d: %s" % (exc.code, detail[:200]),
-                         elapsed_ms=int((time.time() - t_start) * 1000),
-                         key=self._key_id())
-            self._error(exc.code, "公益站上游 %d: %s" % (exc.code, detail))
-            return None
-        except Exception as exc:
-            record_error(model, 502, str(exc),
-                         elapsed_ms=int((time.time() - t_start) * 1000),
-                         key=self._key_id())
-            self._error(502, "公益站不可达: %s" % exc)
-            return None
-
-    def _station_responses(self, payload, chat_req, route, custom_names, request_meta, ns_map):
-        """公益站 Responses：Chat 请求转发站点，响应转回 Responses 格式。"""
-        st_id, real_model = route
-        model = payload.get("model") or real_model
+    def _station_responses(self, payload, chat_req, candidates, custom_names, request_meta, ns_map):
+        """公益站 Responses：Chat 请求转发站点（含故障转移），响应转回 Responses 格式。"""
+        model = payload.get("model") or (candidates[0][1] if candidates else "station")
         want_stream = bool(payload.get("stream"))
-        chat_req["model"] = real_model
+        chat_req["model"] = candidates[0][1] if candidates else model
         chat_req["stream"] = True
         t_start = time.time()
         fp = prompt_fingerprint(chat_req.get("messages"))
-        log("station-responses: model=%s -> station=%s upstream=%s stream=%s key=%s"
-            % (model, st_id, real_model, want_stream,
+        log("station-responses: model=%s candidates=%d stream=%s key=%s"
+            % (model, len(candidates), want_stream,
                key_label(self._key_id()) or "-"))
-        resp = self._station_open_or_error(model, st_id, real_model, chat_req, t_start)
+        resp, st_id, real_model = self._station_open(chat_req, candidates, model, t_start)
         if resp is None:
             return
         with resp:
@@ -19961,19 +19969,18 @@ class Handler(BaseHTTPRequestHandler):
                      gen_ms=(wall - first_ms) if first_ms is not None else None,
                      fp=fp, key=self._key_id())
 
-    def _station_messages(self, payload, chat_req, route):
-        """公益站 Messages：Chat 请求转发站点，响应转回 Anthropic Messages 格式。"""
-        st_id, real_model = route
-        model = payload.get("model") or real_model
+    def _station_messages(self, payload, chat_req, candidates):
+        """公益站 Messages：Chat 请求转发站点（含故障转移），响应转回 Messages 格式。"""
+        model = payload.get("model") or (candidates[0][1] if candidates else "station")
         want_stream = bool(chat_req.get("stream"))
-        chat_req["model"] = real_model
+        chat_req["model"] = candidates[0][1] if candidates else model
         chat_req["stream"] = True
         t_start = time.time()
         fp = prompt_fingerprint(chat_req.get("messages"))
-        log("station-messages: model=%s -> station=%s upstream=%s stream=%s key=%s"
-            % (model, st_id, real_model, want_stream,
+        log("station-messages: model=%s candidates=%d stream=%s key=%s"
+            % (model, len(candidates), want_stream,
                key_label(self._key_id()) or "-"))
-        resp = self._station_open_or_error(model, st_id, real_model, chat_req, t_start)
+        resp, st_id, real_model = self._station_open(chat_req, candidates, model, t_start)
         if resp is None:
             return
         with resp:
