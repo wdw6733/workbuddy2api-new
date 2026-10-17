@@ -3445,6 +3445,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <button class="main-nav-btn" id="btnNavAnalytics" onclick="switchMainTab('analytics')">
         数据看板
       </button>
+      <button class="main-nav-btn" id="btnNavStations" onclick="switchMainTab('stations')">
+        公益站
+      </button>
       <button class="main-nav-btn" id="btnNavAgents" onclick="switchMainTab('agents')">
         智能体配置
       </button>
@@ -4172,6 +4175,84 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
   </div>
 
 
+
+  <div id="pageStations" class="main-page">
+    <div style="margin-bottom:16px">
+      <h2 style="margin:0;font-size:17px;color:var(--fg);font-family:var(--serif);font-weight:600;letter-spacing:.02em">公益站管理</h2>
+      <div style="font-size:12px;color:var(--dim);margin-top:4px">接入 OpenAI 兼容的第三方公益站，测活并勾选模型后，即可在下游客户端（WorkBuddy / Cherry Studio 等）直接调用。</div>
+    </div>
+
+    <section>
+      <h2>站点列表</h2>
+      <div class="toolbar">
+        <button class="primary" onclick="openStationEdit()">+ 添加站点</button>
+        <button class="sec" onclick="probeStationsAll()">全部测活</button>
+        <button class="sec" onclick="loadStations(true)">刷新</button>
+        <span style="align-self:center;font-size:12px;color:var(--dim)" id="stationsHint">模型名冲突时自动加 @站点名 后缀区分。</span>
+      </div>
+      <div style="overflow-x:auto">
+        <table class="data-table" style="width:100%;margin:0;border-collapse:collapse;font-size:12px">
+          <thead><tr>
+            <th style="text-align:left">站点</th>
+            <th style="text-align:left">状态</th>
+            <th style="text-align:left">响应时间</th>
+            <th style="text-align:left">说明</th>
+            <th style="text-align:left">操作</th>
+          </tr></thead>
+          <tbody id="stationsTbody">
+            <tr><td colspan="5" style="color:var(--dim);text-align:center;padding:18px">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <div class="modal-mask" id="stationEditModal" onclick="if(event.target===this) closeStationEdit()">
+    <div class="modal" role="dialog" aria-modal="true" style="width:min(560px,100%)">
+      <div class="modal-hd">
+        <h2 id="stationEditTitle">添加站点</h2>
+        <button class="modal-x" onclick="closeStationEdit()" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-bd">
+        <input type="hidden" id="stationEditId">
+        <div style="font-size:12px;color:var(--dim);margin-bottom:4px">站点名称</div>
+        <input id="stationEditName" class="slot-input" style="margin-bottom:12px" placeholder="例如 幻城网安">
+        <div style="font-size:12px;color:var(--dim);margin-bottom:4px">接口地址（Base URL）</div>
+        <input id="stationEditUrl" class="slot-input" style="margin-bottom:6px" placeholder="https://api.example.com/v1">
+        <div class="hint" style="margin:0 0 12px">填 OpenAI 兼容的 /v1 地址；末尾是否带 /v1 均可，会自动补全。</div>
+        <div style="font-size:12px;color:var(--dim);margin-bottom:4px">API Key</div>
+        <input id="stationEditKey" class="slot-input" style="margin-bottom:12px" placeholder="sk-...（编辑时留空则保留原值）">
+        <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
+          <input type="checkbox" id="stationEditEnabled" checked style="margin:0"> 启用该站点
+        </label>
+      </div>
+      <div class="modal-ft">
+        <button class="sec" onclick="closeStationEdit()">取消</button>
+        <button class="primary" onclick="saveStation()">保存并测活</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-mask" id="stationModelsModal" onclick="if(event.target===this) closeStationModels()">
+    <div class="modal" role="dialog" aria-modal="true" style="width:min(720px,100%)">
+      <div class="modal-hd">
+        <h2>勾选模型 <em id="stationModelsMeta" style="color:var(--dim);font-size:12px;font-style:normal"></em></h2>
+        <button class="modal-x" onclick="closeStationModels()" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-bd">
+        <div class="toolbar">
+          <button class="sec mini" onclick="stationModelsToggle(true)">全选</button>
+          <button class="sec mini" onclick="stationModelsToggle(false)">全不选</button>
+        </div>
+        <div id="stationModelsList" style="max-height:46vh;overflow-y:auto;display:flex;flex-wrap:wrap;gap:8px 16px"></div>
+        <p class="hint" style="margin:12px 0 0" id="stationModelsHint">勾选的模型将出现在网关的 /v1/models 中。</p>
+      </div>
+      <div class="modal-ft">
+        <button class="sec" onclick="closeStationModels()">取消</button>
+        <button class="primary" onclick="saveStationModels()">保存勾选</button>
+      </div>
+    </div>
+  </div>
 
   <div id="pageSettings" class="main-page">
     <div style="margin-bottom:16px">
@@ -11775,6 +11856,7 @@ function switchMainTab(tab){
   const btnLogs = document.getElementById('btnNavLogs');
   const btnSettings = document.getElementById('btnNavSettings');
   const btnAgents = document.getElementById('btnNavAgents');
+  const btnStations = document.getElementById('btnNavStations');
   const pageGateway = document.getElementById('pageGateway');
   const pageTasks = document.getElementById('pageTasks');
   const pageAccounts = document.getElementById('pageAccounts');
@@ -11782,11 +11864,13 @@ function switchMainTab(tab){
   const pageLogs = document.getElementById('pageLogs');
   const pageSettings = document.getElementById('pageSettings');
   const pageAgents = document.getElementById('pageAgents');
+  const pageStations = document.getElementById('pageStations');
   const tabs = [
     ['gateway', btnGateway, pageGateway],
     ['accounts', btnAccounts, pageAccounts],
     ['tasks', btnTasks, pageTasks],
     ['analytics', btnAnalytics, pageAnalytics],
+    ['stations', btnStations, pageStations],
     ['logs', btnLogs, pageLogs],
     ['settings', btnSettings, pageSettings],
     ['agents', btnAgents, pageAgents]
@@ -11802,6 +11886,7 @@ function switchMainTab(tab){
   if(tab === 'tasks'){ loadGrowthTasks(); }
   if(tab === 'accounts' || (!_accountsSeparateTab && tab === 'gateway')){ loadActivityBoard(); }
   if(tab === 'analytics'){ loadAnalytics(); loadAnalyticsMatrix(); }
+  if(tab === 'stations'){ loadStations(); }
   if(tab === 'settings'){ loadSettings(); loadProxySlots(); }
   if(tab === 'agents'){ loadAgents(); }
   if(tab === 'logs'){
@@ -14677,6 +14762,214 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
   apply();
   renderRows();
 })();
+</script>
+<script>
+/* ---- 公益站管理模块 ----
+   后端接口（wb_stations.py / wb_proxy.py）：
+     GET  /stations           → {stations:[...]}
+     POST /stations/save      {id?, name, base_url, api_key, enabled} → {station}
+     POST /stations/delete    {id}
+     POST /stations/probe     {id?}   // 无 id 则全部测活
+     POST /stations/models    {id, models:[...]}
+   每个 station: {id, name, base_url, api_key_masked, enabled, models_selected, models_all, status:{state,latency_ms,detail,checked_at}, note}
+   state: ok | no_models | unavailable | unknown
+   这里只用 getJSON/postJSON/toast/esc。 */
+let STATIONS_DATA = [];
+let STATIONS_LOADING = false;
+let _stationsEditModelsTarget = null;   // 当前正在勾选模型的站点 id
+let _stationsModelsAll = [];            // 该站点已发现模型清单
+let _stationsModelsSelected = [];       // 该站点已勾选模型清单
+
+async function loadStations(showToast){
+  if(STATIONS_LOADING) return;
+  STATIONS_LOADING = true;
+  const tbody = document.getElementById('stationsTbody');
+  try {
+    const data = await getJSON('/stations');
+    STATIONS_DATA = data.stations || [];
+    renderStations();
+  } catch(e){
+    if(tbody) tbody.innerHTML = '<tr><td colspan="5" style="color:var(--bad);text-align:center;padding:18px">加载失败：' + esc(e.message) + '</td></tr>';
+    if(showToast) toast('公益站加载失败：' + e.message, 'bad');
+  } finally {
+    STATIONS_LOADING = false;
+  }
+}
+
+function stationStateBadge(st){
+  const s = (st.status && st.status.state) || 'unknown';
+  const map = {
+    ok: ['正常', 'var(--ok,#16a34a)'],
+    no_models: ['无模型', 'var(--warn,#d97706)'],
+    unavailable: ['不可用', 'var(--bad,#dc2626)'],
+    unknown: ['未测活', 'var(--dim)']
+  };
+  const row = map[s] || map.unknown;
+  return '<span style="display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600;color:#fff;background:' + row[1] + '">' + row[0] + '</span>';
+}
+
+function stationLatency(st){
+  const ms = st.status && st.status.latency_ms;
+  if(ms == null) return '<span style="color:var(--dim)">—</span>';
+  const s = ms < 1000 ? ms + ' ms' : (ms/1000).toFixed(1) + ' s';
+  return '<span style="font-variant-numeric:tabular-nums">' + s + '</span>';
+}
+
+function renderStations(){
+  const tbody = document.getElementById('stationsTbody');
+  if(!tbody) return;
+  if(!STATIONS_DATA.length){
+    tbody.innerHTML = '<tr><td colspan="5" style="color:var(--dim);text-align:center;padding:22px">还没有站点，点击「添加站点」接入第一个公益站。</td></tr>';
+    return;
+  }
+  let html = '';
+  STATIONS_DATA.forEach(function(st){
+    const url = st.base_url || '';
+    html += '<tr>' +
+      '<td><div style="font-weight:600">' + esc(st.name) + '</div>' +
+          '<div style="color:var(--dim);font-size:11px;word-break:break-all">' + esc(url) + '</div>' +
+          (st.enabled ? '' : '<span style="color:var(--warn,#d97706);font-size:11px">（已停用）</span>') + '</td>' +
+      '<td>' + stationStateBadge(st) + '</td>' +
+      '<td>' + stationLatency(st) + '</td>' +
+      '<td style="max-width:280px">' + esc(st.note || '') + '</td>' +
+      '<td><div style="display:flex;gap:6px;flex-wrap:wrap">' +
+        '<button class="sec mini" onclick="probeStation(\'' + st.id + '\')">测活</button>' +
+        '<button class="sec mini" onclick="openStationModels(\'' + st.id + '\')">选模型</button>' +
+        '<button class="sec mini" onclick="openStationEdit(\'' + st.id + '\')">编辑</button>' +
+        '<button class="sec mini danger" onclick="deleteStation(\'' + st.id + '\')">删除</button>' +
+      '</div></td>' +
+      '</tr>';
+  });
+  tbody.innerHTML = html;
+}
+
+function stationById(id){
+  for(let i=0;i<STATIONS_DATA.length;i++){ if(STATIONS_DATA[i].id === id) return STATIONS_DATA[i]; }
+  return null;
+}
+
+function openStationEdit(id){
+  const st = id ? stationById(id) : null;
+  document.getElementById('stationEditId').value = id || '';
+  document.getElementById('stationEditTitle').textContent = st ? '编辑站点' : '添加站点';
+  document.getElementById('stationEditName').value = st ? (st.name || '') : '';
+  document.getElementById('stationEditUrl').value = st ? (st.base_url || '') : '';
+  document.getElementById('stationEditKey').value = '';
+  document.getElementById('stationEditEnabled').checked = st ? !!st.enabled : true;
+  document.getElementById('stationEditModal').classList.add('show');
+}
+function closeStationEdit(){
+  document.getElementById('stationEditModal').classList.remove('show');
+}
+
+async function saveStation(){
+  const id = document.getElementById('stationEditId').value;
+  const name = document.getElementById('stationEditName').value.trim();
+  const url = document.getElementById('stationEditUrl').value.trim();
+  const key = document.getElementById('stationEditKey').value.trim();
+  const enabled = document.getElementById('stationEditEnabled').checked;
+  if(!name || !url){ toast('站点名称和接口地址不能为空', 'bad'); return; }
+  try {
+    const body = { id: id, name: name, base_url: url, enabled: enabled };
+    if(key) body.api_key = key;
+    await postJSON('/stations/save', body);
+    closeStationEdit();
+    toast('已保存，正在测活…', 'ok');
+    await loadStations();
+    // 测活是后台线程，稍后自动刷新一次
+    setTimeout(function(){ loadStations(); }, 2500);
+  } catch(e){
+    toast('保存失败：' + e.message, 'bad');
+  }
+}
+
+async function deleteStation(id){
+  const st = stationById(id);
+  if(!confirm('确定删除站点「' + (st ? st.name : id) + '」吗？')) return;
+  try {
+    await postJSON('/stations/delete', { id: id });
+    toast('已删除', 'ok');
+    await loadStations();
+  } catch(e){
+    toast('删除失败：' + e.message, 'bad');
+  }
+}
+
+async function probeStation(id){
+  const st = stationById(id);
+  const btn = event && event.currentTarget;
+  if(btn){ btn.disabled = true; btn.textContent = '测活中…'; }
+  try {
+    const r = await postJSON('/stations/probe', { id: id });
+    await loadStations();
+    const s = r.station && r.station.status;
+    if(s && s.state === 'ok') toast('测活通过：' + (s.latency_ms != null ? s.latency_ms + ' ms' : ''), 'ok');
+    else toast('测活完成：' + (s ? s.state : ''), (s && s.state === 'ok') ? 'ok' : 'bad');
+  } catch(e){
+    toast('测活失败：' + e.message, 'bad');
+    await loadStations();
+  } finally {
+    if(btn){ btn.disabled = false; btn.textContent = '测活'; }
+  }
+}
+
+async function probeStationsAll(){
+  try {
+    await postJSON('/stations/probe', {});
+    toast('已开始全部测活，稍后自动刷新', 'ok');
+    setTimeout(function(){ loadStations(); }, 3000);
+    setTimeout(function(){ loadStations(); }, 6000);
+  } catch(e){
+    toast('测活失败：' + e.message, 'bad');
+  }
+}
+
+function openStationModels(id){
+  const st = stationById(id);
+  if(!st) return;
+  _stationsEditModelsTarget = id;
+  _stationsModelsAll = st.models_all || [];
+  _stationsModelsSelected = (st.models_selected || []).slice();
+  document.getElementById('stationModelsMeta').textContent = st.name;
+  renderStationModels();
+  document.getElementById('stationModelsModal').classList.add('show');
+}
+function closeStationModels(){
+  document.getElementById('stationModelsModal').classList.remove('show');
+}
+function renderStationModels(){
+  const box = document.getElementById('stationModelsList');
+  const hint = document.getElementById('stationModelsHint');
+  if(!_stationsModelsAll.length){
+    box.innerHTML = '<span style="color:var(--dim)">该站点尚未发现模型，请先「测活」。</span>';
+    return;
+  }
+  let html = '';
+  _stationsModelsAll.forEach(function(m){
+    const on = _stationsModelsSelected.indexOf(m) >= 0;
+    html += '<label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;min-width:180px">' +
+      '<input type="checkbox" data-m="' + esc(m) + '" ' + (on ? 'checked' : '') + ' style="margin:0">' + esc(m) + '</label>';
+  });
+  box.innerHTML = html;
+  if(hint) hint.textContent = '已选 ' + _stationsModelsSelected.length + ' / ' + _stationsModelsAll.length + ' 个模型。';
+}
+function stationModelsToggle(on){
+  const box = document.getElementById('stationModelsList');
+  box.querySelectorAll('input[data-m]').forEach(function(cb){ cb.checked = on; });
+}
+async function saveStationModels(){
+  const box = document.getElementById('stationModelsList');
+  const picked = [];
+  box.querySelectorAll('input[data-m]').forEach(function(cb){ if(cb.checked) picked.push(cb.getAttribute('data-m')); });
+  try {
+    await postJSON('/stations/models', { id: _stationsEditModelsTarget, models: picked });
+    closeStationModels();
+    toast('已保存勾选，共 ' + picked.length + ' 个模型', 'ok');
+    await loadStations();
+  } catch(e){
+    toast('保存失败：' + e.message, 'bad');
+  }
+}
 </script>
 </body>
 </html>
