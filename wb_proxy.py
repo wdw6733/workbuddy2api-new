@@ -16759,6 +16759,8 @@ class Handler(BaseHTTPRequestHandler):
             checkin_method = payload.get("checkin_method")
             checkin_token = payload.get("checkin_token")
             checkin_user_id = payload.get("checkin_user_id")
+            login_username = payload.get("login_username")
+            login_password = payload.get("login_password")
             enabled = payload.get("enabled")
             if enabled is not None:
                 enabled = bool(enabled)
@@ -16773,7 +16775,9 @@ class Handler(BaseHTTPRequestHandler):
                     checkin_url=checkin_url or None, priority=priority,
                     checkin_method=checkin_method,
                     checkin_token=checkin_token,
-                    checkin_user_id=checkin_user_id)
+                    checkin_user_id=checkin_user_id,
+                    login_username=login_username,
+                    login_password=login_password)
                 if not st:
                     return self._error(404, "station not found", "invalid_request_error")
             else:
@@ -16783,7 +16787,9 @@ class Handler(BaseHTTPRequestHandler):
                     st = wb_stations.update_station(
                         st["id"], checkin_method=checkin_method,
                         checkin_token=checkin_token,
-                        checkin_user_id=checkin_user_id) or st
+                        checkin_user_id=checkin_user_id,
+                        login_username=login_username,
+                        login_password=login_password) or st
             wb_stations.probe_one_async(st["id"])
             wb_stations.fetch_balance_all_async()
             return self._json(200, {"ok": True, "station": st})
@@ -16825,6 +16831,12 @@ class Handler(BaseHTTPRequestHandler):
             if not st_id:
                 return self._error(400, "id is required", "invalid_request_error")
             ok, msg = wb_stations.checkin(st_id)
+            return self._json(200, {"ok": ok, "message": msg})
+        if path == "/stations/login":
+            st_id = str(payload.get("id") or "").strip()
+            if not st_id:
+                return self._error(400, "id is required", "invalid_request_error")
+            ok, msg = wb_stations.login_station(st_id)
             return self._json(200, {"ok": ok, "message": msg})
         return self._error(404, "not found", "invalid_request_error")
 

@@ -16,6 +16,12 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import http.cookiejar
+
+# 浏览器 UA：公益站普遍套了 Cloudflare/WAF，Python 默认 UA（Python-urllib）
+# 会被直接 403，全部请求统一带浏览器 UA。
+_BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 # 测活超时（秒）。公益站普遍慢，给足 10 秒。
 PROBE_TIMEOUT = 10
@@ -96,7 +102,8 @@ def _station_default_status():
     return {"state": "unknown", "latency_ms": None, "detail": "", "checked_at": None}
 
 
-def add_station(name, base_url, api_key, enabled=True, priority=0, checkin_url=""):
+def add_station(name, base_url, api_key, enabled=True, priority=0, checkin_url="",
+                login_username="", login_password=""):
     """新增站点；返回站点 dict。base_url 建议 .../v1 结尾（也兼容根地址）。"""
     try:
         priority = int(priority)
@@ -112,6 +119,8 @@ def add_station(name, base_url, api_key, enabled=True, priority=0, checkin_url="
         "checkin_method": "GET",
         "checkin_token": "",
         "checkin_user_id": "",
+        "login_username": str(login_username or "").strip(),
+        "login_password": str(login_password or "").strip(),
         "priority": priority,
         "models_selected": [],
         "models_all": [],
@@ -126,7 +135,8 @@ def add_station(name, base_url, api_key, enabled=True, priority=0, checkin_url="
 
 def update_station(st_id, name=None, base_url=None, api_key=None, enabled=None,
                    checkin_url=None, priority=None, checkin_method=None,
-                   checkin_token=None, checkin_user_id=None):
+                   checkin_token=None, checkin_user_id=None,
+                   login_username=None, login_password=None):
     """更新站点；api_key 传 None 或空串表示保留原值。返回更新后的站点或 None。"""
     with _LOCK:
         st = _find(st_id)
@@ -157,6 +167,10 @@ def update_station(st_id, name=None, base_url=None, api_key=None, enabled=None,
             st["checkin_token"] = str(checkin_token).strip()
         if checkin_user_id is not None:
             st["checkin_user_id"] = str(checkin_user_id).strip()
+        if login_username is not None:
+            st["login_username"] = str(login_username).strip()
+        if login_password is not None and str(login_password).strip():
+            st["login_password"] = str(login_password).strip()
         # 地址或密钥变了，旧测活结果不再可信
         st["status"] = _station_default_status()
         st["models_all"] = []
@@ -223,7 +237,7 @@ def _chat_url(st):
 
 
 def _auth_headers(st):
-    h = {"Content-Type": "application/json"}
+    h = {"Content-Type": "application/json", "User-Agent": _BROWSER_UA}
     key = st.get("api_key") or ""
     if key:
         h["Authorization"] = "Bearer " + key
@@ -524,6 +538,9 @@ def view():
             item["checkin_method"] = st.get("checkin_method") or "GET"
             item["checkin_token_set"] = bool(str(st.get("checkin_token") or "").strip())
             item["checkin_user_id"] = st.get("checkin_user_id") or ""
+            item["login_username"] = st.get("login_username") or ""
+            item["login_password_set"] = bool(str(st.get("login_password") or "").strip())
+            item.pop("login_password", None)
             item["last_checkin"] = st.get("last_checkin")
             out.append(item)
         return out
@@ -651,7 +668,7 @@ def _user_api_headers(st):
     生成，非 sk- API Key）+ New-Api-User: <用户ID> 头。令牌优先取站点配置的
     checkin_token，没有则回退 api_key（兼容少数用 API Key 鉴权的站）。
     """
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": "application/json", "User-Agent": _BROWSER_UA}
     token = str(st.get("checkin_token") or "").strip() or str(st.get("api_key") or "").strip()
     if token:
         headers["Authorization"] = "Bearer " + token
@@ -733,4 +750,73 @@ def _daily_checkin_loop():
 def start_daily_checkin():
     threading.Thread(target=_daily_checkin_loop, daemon=True,
                      name="wb-stations-checkin").start()
+
+
+# ---- 账号登录：自动获取系统访问令牌 ----------------------------------
+
+LOGIN_TIMEOUT = 15
+
+
+def login_station(st_id):
+    """用账号密码登录站点（New API 标准 /api/user/login），自动获取系统访问令牌。
+
+    流程：POST /api/user/login → session cookie → 若响应未带 access_token，
+    再 GET /api/user/token 生成。拿到后写入 checkin_token / checkin_user_id，
+    之后的余额查询与签到就都自动可用了。
+    返回 (ok, message)。
+    """
+    with _LOCK:
+        st = _find(st_id)
+        snap = json.loads(json.dumps(st)) if st else None
+    if not snap:
+        return (False, "站点不存在")
+    username = str(snap.get("login_username") or "").strip()
+    password = str(snap.get("login_password") or "").strip()
+    if not username or not password:
+        return (False, "请先在站点编辑里填写登录账号和密码")
+    root = _root_url(snap)
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    base_headers = {"Accept": "application/json", "User-Agent": _BROWSER_UA}
+    try:
+        # 1. 登录
+        body = json.dumps({"username": username, "password": password},
+                          ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            root + "/api/user/login", data=body,
+            headers=dict(base_headers, **{"Content-Type": "application/json"}),
+            method="POST")
+        with opener.open(req, timeout=LOGIN_TIMEOUT) as resp:
+            data = json.loads(resp.read(256 * 1024).decode("utf-8", "replace"))
+        if not (isinstance(data, dict) and data.get("success")):
+            msg = str((data or {}).get("message") or "未知错误")[:120]
+            return (False, "登录失败: " + msg)
+        user = data.get("data") or {}
+        uid = str(user.get("id") or "").strip()
+        token = str(user.get("access_token") or "").strip()
+        # 2. 响应没带令牌时，用 session cookie 调生成接口
+        if not token:
+            req2 = urllib.request.Request(root + "/api/user/token",
+                                          headers=base_headers, method="GET")
+            with opener.open(req2, timeout=LOGIN_TIMEOUT) as resp2:
+                d2 = json.loads(resp2.read(256 * 1024).decode("utf-8", "replace"))
+            if isinstance(d2, dict) and d2.get("success"):
+                token = str(d2.get("data") or "").strip()
+        if not token:
+            return (False, "登录成功，但站点未返回访问令牌（可能需要先在站点个人设置里生成）")
+        with _LOCK:
+            st = _find(st_id)
+            if st:
+                st["checkin_token"] = token
+                if uid:
+                    st["checkin_user_id"] = uid
+                save()
+        _logmsg("stations   : 登录 %s -> 已获取系统访问令牌%s"
+                % (snap.get("name"), ("（用户 %s）" % uid) if uid else ""))
+        return (True, "已获取系统访问令牌" + ("（用户 %s）" % uid if uid else "")
+                + "，余额与签到现在可用")
+    except urllib.error.HTTPError as exc:
+        return (False, "登录失败: HTTP %d" % exc.code)
+    except Exception as exc:
+        return (False, "登录失败: " + str(exc)[:120])
 
