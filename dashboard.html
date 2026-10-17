@@ -4222,6 +4222,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         <div class="hint" style="margin:0 0 12px">填 OpenAI 兼容的 /v1 地址；末尾是否带 /v1 均可，会自动补全。</div>
         <div style="font-size:12px;color:var(--dim);margin-bottom:4px">API Key</div>
         <input id="stationEditKey" class="slot-input" style="margin-bottom:12px" placeholder="sk-...（编辑时留空则保留原值）">
+        <div style="font-size:12px;color:var(--dim);margin-bottom:4px">签到地址（可选）</div>
+        <input id="stationEditCheckin" class="slot-input" style="margin-bottom:6px" placeholder="https://example.com/api/checkin">
+        <div class="hint" style="margin:0 0 12px">各公益站签到接口不同，填该站自己的签到链接后，网关会每天 08:00 自动调用一次。</div>
         <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
           <input type="checkbox" id="stationEditEnabled" checked style="margin:0"> 启用该站点
         </label>
@@ -14835,6 +14838,8 @@ function renderStations(){
       '<td><div style="display:flex;gap:6px;flex-wrap:wrap">' +
         '<button class="sec mini" onclick="probeStation(\'' + st.id + '\')">测活</button>' +
         '<button class="sec mini" onclick="openStationModels(\'' + st.id + '\')">选模型</button>' +
+        '<button class="sec mini" onclick="fetchStationBalance(\'' + st.id + '\')">余额</button>' +
+        '<button class="sec mini" onclick="checkinStation(\'' + st.id + '\')">签到</button>' +
         '<button class="sec mini" onclick="openStationEdit(\'' + st.id + '\')">编辑</button>' +
         '<button class="sec mini danger" onclick="deleteStation(\'' + st.id + '\')">删除</button>' +
       '</div></td>' +
@@ -14855,6 +14860,7 @@ function openStationEdit(id){
   document.getElementById('stationEditName').value = st ? (st.name || '') : '';
   document.getElementById('stationEditUrl').value = st ? (st.base_url || '') : '';
   document.getElementById('stationEditKey').value = '';
+  document.getElementById('stationEditCheckin').value = st ? (st.checkin_url || '') : '';
   document.getElementById('stationEditEnabled').checked = st ? !!st.enabled : true;
   document.getElementById('stationEditModal').classList.add('show');
 }
@@ -14867,11 +14873,13 @@ async function saveStation(){
   const name = document.getElementById('stationEditName').value.trim();
   const url = document.getElementById('stationEditUrl').value.trim();
   const key = document.getElementById('stationEditKey').value.trim();
+  const checkin = document.getElementById('stationEditCheckin').value.trim();
   const enabled = document.getElementById('stationEditEnabled').checked;
   if(!name || !url){ toast('站点名称和接口地址不能为空', 'bad'); return; }
   try {
     const body = { id: id, name: name, base_url: url, enabled: enabled };
     if(key) body.api_key = key;
+    if(checkin) body.checkin_url = checkin;
     await postJSON('/stations/save', body);
     closeStationEdit();
     toast('已保存，正在测活…', 'ok');
@@ -14921,6 +14929,49 @@ async function probeStationsAll(){
     setTimeout(function(){ loadStations(); }, 6000);
   } catch(e){
     toast('测活失败：' + e.message, 'bad');
+  }
+}
+
+async function fetchStationBalance(id){
+  const st = stationById(id);
+  const btn = event && event.currentTarget;
+  if(btn){ btn.disabled = true; btn.textContent = '查询中…'; }
+  try {
+    const r = await postJSON('/stations/balance', { id: id });
+    if(r.ok && r.balance){
+      const b = r.balance;
+      if(b.error){ toast((st ? st.name : '站点') + ' 余额查询失败：' + b.error, 'bad'); }
+      else {
+        const remain = (b.remain_quota != null) ? b.remain_quota : b.quota;
+        let msg = (st ? st.name : '站点');
+        if(b.username) msg += '（' + b.username + '）';
+        msg += ' 剩余 $' + (remain != null ? Number(remain).toFixed(2) : '未知');
+        toast(msg, 'ok');
+      }
+    } else {
+      toast('未取到余额（可能该站不支持 /api/user/self）', 'bad');
+    }
+    await loadStations();
+  } catch(e){
+    toast('余额查询失败：' + e.message, 'bad');
+  } finally {
+    if(btn){ btn.disabled = false; btn.textContent = '余额'; }
+  }
+}
+
+async function checkinStation(id){
+  const st = stationById(id);
+  const btn = event && event.currentTarget;
+  if(btn){ btn.disabled = true; btn.textContent = '签到中…'; }
+  try {
+    const r = await postJSON('/stations/checkin', { id: id });
+    if(r.ok){ toast((st ? st.name : '站点') + ' 签到成功', 'ok'); }
+    else { toast('签到失败：' + r.message, 'bad'); }
+    await loadStations();
+  } catch(e){
+    toast('签到失败：' + e.message, 'bad');
+  } finally {
+    if(btn){ btn.disabled = false; btn.textContent = '签到'; }
   }
 }
 

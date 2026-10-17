@@ -16749,12 +16749,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_stations(self, path, payload):
         """面板公益站管理写接口：/stations/save | /stations/delete |
-        /stations/probe | /stations/models。"""
+        /stations/probe | /stations/models | /stations/balance | /stations/checkin。"""
         if path == "/stations/save":
             st_id = str(payload.get("id") or "").strip()
             name = str(payload.get("name") or "").strip()
             base_url = str(payload.get("base_url") or "").strip()
             api_key = str(payload.get("api_key") or "").strip()
+            checkin_url = str(payload.get("checkin_url") or "").strip()
             enabled = payload.get("enabled")
             if enabled is not None:
                 enabled = bool(enabled)
@@ -16764,12 +16765,16 @@ class Handler(BaseHTTPRequestHandler):
             if st_id:
                 st = wb_stations.update_station(
                     st_id, name=name, base_url=base_url,
-                    api_key=api_key or None, enabled=enabled)
+                    api_key=api_key or None, enabled=enabled,
+                    checkin_url=checkin_url or None)
                 if not st:
                     return self._error(404, "station not found", "invalid_request_error")
             else:
                 st = wb_stations.add_station(name, base_url, api_key, enabled=enabled)
+                if checkin_url:
+                    wb_stations.set_checkin_url(st["id"], checkin_url)
             wb_stations.probe_one_async(st["id"])
+            wb_stations.fetch_balance_all_async()
             return self._json(200, {"ok": True, "station": st})
         if path == "/stations/delete":
             st_id = str(payload.get("id") or "").strip()
@@ -16793,6 +16798,23 @@ class Handler(BaseHTTPRequestHandler):
             if not st:
                 return self._error(404, "station not found", "invalid_request_error")
             return self._json(200, {"ok": True, "station": st})
+        if path == "/stations/balance":
+            st_id = str(payload.get("id") or "").strip()
+            if st_id:
+                ok, bal = wb_stations.fetch_balance(st_id)
+                if not bal:
+                    st = wb_stations.get_station(st_id)
+                    if not st:
+                        return self._error(404, "station not found", "invalid_request_error")
+                return self._json(200, {"ok": ok, "balance": bal})
+            wb_stations.fetch_balance_all_async()
+            return self._json(200, {"ok": True, "balance_all": True})
+        if path == "/stations/checkin":
+            st_id = str(payload.get("id") or "").strip()
+            if not st_id:
+                return self._error(400, "id is required", "invalid_request_error")
+            ok, msg = wb_stations.checkin(st_id)
+            return self._json(200, {"ok": ok, "message": msg})
         return self._error(404, "not found", "invalid_request_error")
 
     def _get_panel_status(self):
@@ -19077,6 +19099,11 @@ class Handler(BaseHTTPRequestHandler):
             "tool_choice": payload.get("tool_choice", "auto"),
             "parallel_tool_calls": payload.get("parallel_tool_calls", True),
         }
+        # 公益站路由：命中站点模型时走站点转发（Responses → Chat → 站点 → Responses）
+        station_route = wb_stations.resolve(chat_req.get("model"))
+        if station_route:
+            return self._station_responses(payload, chat_req, station_route,
+                                           custom_names, request_meta, ns_map)
         model = payload.get("model") or "deepseek-v4.1-flash"
         want_stream = bool(payload.get("stream"))
         t_start = time.time()
@@ -19297,6 +19324,10 @@ class Handler(BaseHTTPRequestHandler):
             chat_req = messages_to_chat(payload)
         except ValueError as exc:
             return self._anthropic_error(400, str(exc), "invalid_request_error")
+        # 公益站路由：命中站点模型时走站点转发（Messages → Chat → 站点 → Messages）
+        station_route = wb_stations.resolve(chat_req.get("model"))
+        if station_route:
+            return self._station_messages(payload, chat_req, station_route)
         model = chat_req.get("model") or "unknown"
         want_stream = bool(chat_req.get("stream"))
         session_key = extract_session_key(self.headers, chat_req)
@@ -19826,6 +19857,186 @@ class Handler(BaseHTTPRequestHandler):
         if obj is not None:
             return self._json(200, obj)
         return self._json(200, {"raw": body.decode("utf-8", "replace")})
+
+    def _station_open_or_error(self, model, st_id, real_model, chat_req, t_start):
+        """打开站点对话流；失败时记录并回错误响应，返回 None。"""
+        try:
+            return wb_stations.open_chat(st_id, real_model, chat_req)
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read(600).decode("utf-8", "replace")
+            except Exception:
+                pass
+            record_error(model, exc.code, "station HTTP %d: %s" % (exc.code, detail[:200]),
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         key=self._key_id())
+            self._error(exc.code, "公益站上游 %d: %s" % (exc.code, detail))
+            return None
+        except Exception as exc:
+            record_error(model, 502, str(exc),
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         key=self._key_id())
+            self._error(502, "公益站不可达: %s" % exc)
+            return None
+
+    def _station_responses(self, payload, chat_req, route, custom_names, request_meta, ns_map):
+        """公益站 Responses：Chat 请求转发站点，响应转回 Responses 格式。"""
+        st_id, real_model = route
+        model = payload.get("model") or real_model
+        want_stream = bool(payload.get("stream"))
+        chat_req["model"] = real_model
+        chat_req["stream"] = True
+        t_start = time.time()
+        fp = prompt_fingerprint(chat_req.get("messages"))
+        log("station-responses: model=%s -> station=%s upstream=%s stream=%s key=%s"
+            % (model, st_id, real_model, want_stream,
+               key_label(self._key_id()) or "-"))
+        resp = self._station_open_or_error(model, st_id, real_model, chat_req, t_start)
+        if resp is None:
+            return
+        with resp:
+            if not want_stream:
+                try:
+                    chat_obj = aggregate_stream(resp, real_model, None)
+                except Exception as exc:
+                    record_error(model, 502, "station responses error: %s" % exc,
+                                 elapsed_ms=int((time.time() - t_start) * 1000),
+                                 key=self._key_id())
+                    return self._error(502, "公益站响应解析失败: %s" % exc)
+                result = chat_to_response(chat_obj, model, custom_names, request_meta, ns_map,
+                                          sources=[])
+                record_usage(model, chat_obj.get("usage"), stream=False,
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             fp=fp, key=self._key_id())
+                return self._json(200, result)
+            return self._station_responses_stream(
+                resp, model, custom_names, request_meta, ns_map, chat_req, fp, t_start)
+
+    def _station_responses_stream(self, resp, model, custom_names, request_meta, ns_map,
+                                  base_body, fp, t_start):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        if cors_origin_allowed(self.path):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        holder = {
+            "custom_names": custom_names,
+            "request_meta": request_meta,
+            "namespace_map": ns_map,
+            "base_body": base_body,
+            "web_sources": [],
+            "usage": None,
+        }
+        first_ms = None
+        try:
+            for frame in stream_responses_events(resp, model, holder):
+                if first_ms is None:
+                    first_ms = int((time.time() - t_start) * 1000)
+                self.wfile.write(clean_responses_frame(frame))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            wall = int((time.time() - t_start) * 1000)
+            record_usage(model, holder.get("usage"), stream=True, elapsed_ms=wall,
+                         ttft_ms=first_ms, fp=fp, outcome="client_aborted",
+                         key=self._key_id())
+            return
+        except Exception as exc:
+            wall = int((time.time() - t_start) * 1000)
+            record_error(model, 502, "station responses stream aborted: %s" % exc,
+                         elapsed_ms=wall, usage=holder.get("usage"), stream=True,
+                         ttft_ms=first_ms, fp=fp, outcome="upstream_aborted",
+                         key=self._key_id())
+            return
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        wall = int((time.time() - t_start) * 1000)
+        record_usage(model, holder.get("usage"), stream=True, elapsed_ms=wall,
+                     ttft_ms=first_ms,
+                     gen_ms=(wall - first_ms) if first_ms is not None else None,
+                     fp=fp, key=self._key_id())
+
+    def _station_messages(self, payload, chat_req, route):
+        """公益站 Messages：Chat 请求转发站点，响应转回 Anthropic Messages 格式。"""
+        st_id, real_model = route
+        model = payload.get("model") or real_model
+        want_stream = bool(chat_req.get("stream"))
+        chat_req["model"] = real_model
+        chat_req["stream"] = True
+        t_start = time.time()
+        fp = prompt_fingerprint(chat_req.get("messages"))
+        log("station-messages: model=%s -> station=%s upstream=%s stream=%s key=%s"
+            % (model, st_id, real_model, want_stream,
+               key_label(self._key_id()) or "-"))
+        resp = self._station_open_or_error(model, st_id, real_model, chat_req, t_start)
+        if resp is None:
+            return
+        with resp:
+            if not want_stream:
+                try:
+                    chat_obj = aggregate_stream(resp, real_model, None)
+                except Exception as exc:
+                    record_error(model, 502, "station messages error: %s" % exc,
+                                 elapsed_ms=int((time.time() - t_start) * 1000),
+                                 key=self._key_id())
+                    return self._anthropic_error(502, "公益站响应解析失败: %s" % exc)
+                result = chat_to_messages(chat_obj)
+                record_usage(model, chat_obj.get("usage"), stream=False,
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             fp=fp, key=self._key_id())
+                return self._json(200, result)
+            return self._station_messages_stream(resp, model, fp, t_start)
+
+    def _station_messages_stream(self, resp, model, fp, t_start):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        if cors_origin_allowed(self.path):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        holder = {"usage": None}
+        first_ms = None
+        try:
+            for frame in stream_messages_events(resp, model, holder):
+                if first_ms is None:
+                    first_ms = int((time.time() - t_start) * 1000)
+                self.wfile.write(frame)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            wall = int((time.time() - t_start) * 1000)
+            record_usage(model, holder.get("usage"), stream=True, elapsed_ms=wall,
+                         ttft_ms=first_ms, fp=fp, outcome="client_aborted",
+                         key=self._key_id())
+            return
+        except Exception as exc:
+            wall = int((time.time() - t_start) * 1000)
+            record_error(model, 502, "station messages stream aborted: %s" % exc,
+                         elapsed_ms=wall, usage=holder.get("usage"), stream=True,
+                         ttft_ms=first_ms, fp=fp, outcome="upstream_aborted",
+                         key=self._key_id())
+            try:
+                self.wfile.write(anthropic_sse_frame("error", {
+                    "error": {"type": "api_error", "message": str(exc)}}))
+                self.wfile.flush()
+            except Exception:
+                pass
+            return
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        wall = int((time.time() - t_start) * 1000)
+        record_usage(model, holder.get("usage"), stream=True, elapsed_ms=wall,
+                     ttft_ms=first_ms,
+                     gen_ms=(wall - first_ms) if first_ms is not None else None,
+                     fp=fp, key=self._key_id())
 
     def _chat_stream_response(self, upstream, model, fp, account, t_start, effort=None):
             self.send_response(200)

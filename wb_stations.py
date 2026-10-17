@@ -39,6 +39,8 @@ def init(accounts_dir, log=None):
     # 给面板一个立刻可用的路由表（哪怕还没测活过）
     _rebuild_routes()
     probe_all_async()
+    fetch_balance_all_async()
+    start_daily_checkin()
     if _LOG:
         _LOG("stations   : %d 个公益站已载入 (%s)" % (len(_STATIONS), _STATIONS_FILE))
 
@@ -98,6 +100,7 @@ def add_station(name, base_url, api_key, enabled=True):
         "base_url": _norm_base_url(base_url),
         "api_key": str(api_key or "").strip(),
         "enabled": bool(enabled),
+        "checkin_url": "",
         "models_selected": [],
         "models_all": [],
         "status": _station_default_status(),
@@ -109,7 +112,8 @@ def add_station(name, base_url, api_key, enabled=True):
     return st
 
 
-def update_station(st_id, name=None, base_url=None, api_key=None, enabled=None):
+def update_station(st_id, name=None, base_url=None, api_key=None, enabled=None,
+                   checkin_url=None):
     """更新站点；api_key 传 None 或空串表示保留原值。返回更新后的站点或 None。"""
     with _LOCK:
         st = _find(st_id)
@@ -123,6 +127,11 @@ def update_station(st_id, name=None, base_url=None, api_key=None, enabled=None):
             st["api_key"] = str(api_key).strip()
         if enabled is not None:
             st["enabled"] = bool(enabled)
+        if checkin_url is not None:
+            new_url = str(checkin_url).strip()
+            if new_url != str(st.get("checkin_url") or "").strip():
+                st["checkin_url"] = new_url
+                st.pop("last_checkin", None)
         # 地址或密钥变了，旧测活结果不再可信
         st["status"] = _station_default_status()
         st["models_all"] = []
@@ -396,6 +405,24 @@ def view():
             else:
                 note = "尚未测活"
             item["note"] = note
+            # 余额展示（New API / One API 兼容探测）
+            bal = st.get("balance")
+            if isinstance(bal, dict):
+                item["balance"] = bal
+                if bal.get("error"):
+                    note += "｜余额查询失败"
+                else:
+                    remain = bal.get("remain_quota")
+                    if remain is None:
+                        remain = bal.get("quota")
+                    if remain is not None:
+                        try:
+                            note += "｜余额 $%.2f" % float(remain)
+                        except Exception:
+                            pass
+            item["note"] = note
+            item["checkin_url"] = st.get("checkin_url") or ""
+            item["last_checkin"] = st.get("last_checkin")
             out.append(item)
         return out
 
@@ -419,3 +446,172 @@ def open_chat(st_id, real_model, payload):
     req = urllib.request.Request(
         _chat_url(snap), data=data, headers=_auth_headers(snap), method="POST")
     return urllib.request.urlopen(req, timeout=CHAT_TIMEOUT)
+
+
+# ---- 余额查询（New API / One API 兼容） ------------------------------
+
+BALANCE_TIMEOUT = 8
+
+
+def _root_url(st):
+    """从 base_url 推导站点根地址（去掉 /v1、/api 等尾巴）。"""
+    base = str(st.get("base_url") or "").rstrip("/")
+    for suffix in ("/v1", "/api/v1", "/api"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    return base.rstrip("/")
+
+
+def _balance_url(st):
+    return _root_url(st) + "/api/user/self"
+
+
+def fetch_balance(st_id):
+    """探测站点余额（New API / One API 的 /api/user/self）。
+
+    宽容解析 quota / used_quota / remain_quota 字段，写入站点 balance。
+    返回 (ok, balance_dict)；失败返回 (False, None)。
+    """
+    with _LOCK:
+        st = _find(st_id)
+        snap = json.loads(json.dumps(st)) if st else None
+    if not snap:
+        return (False, None)
+    t0 = time.time()
+    try:
+        headers = {"Accept": "application/json"}
+        key = snap.get("api_key") or ""
+        if key:
+            headers["Authorization"] = "Bearer " + key
+        req = urllib.request.Request(_balance_url(snap), headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=BALANCE_TIMEOUT) as resp:
+            body = resp.read(512 * 1024).decode("utf-8", "replace")
+        data = json.loads(body)
+        d = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(d, dict):
+            return (False, None)
+        # 不同版本字段各异，能做几个算几个
+        balance = {"checked_at": time.time(), "latency_ms": int((time.time() - t0) * 1000)}
+        for f in ("quota", "used_quota", "remain_quota", "request_count"):
+            if d.get(f) is not None:
+                balance[f] = d[f]
+        if "remain_quota" not in balance and "quota" in balance and "used_quota" in balance:
+            try:
+                balance["remain_quota"] = balance["quota"] - balance["used_quota"]
+            except Exception:
+                pass
+        # 用户名用于展示
+        if d.get("username"):
+            balance["username"] = d["username"]
+        with _LOCK:
+            st = _find(st_id)
+            if st:
+                st["balance"] = balance
+                save()
+        _logmsg("stations   : 余额 %s -> %s" % (snap.get("name"), balance))
+        return (True, balance)
+    except Exception as exc:
+        with _LOCK:
+            st = _find(st_id)
+            if st:
+                st["balance"] = {"checked_at": time.time(), "error": str(exc)[:120]}
+                save()
+        return (False, None)
+
+
+def fetch_balance_all_async():
+    def _run():
+        with _LOCK:
+            ids = [s["id"] for s in _STATIONS if s.get("enabled")]
+        ok = 0
+        for sid in ids:
+            if fetch_balance(sid)[0]:
+                ok += 1
+        _logmsg("stations   : 余额刷新完成（%d/%d 站点成功）" % (ok, len(ids)))
+    threading.Thread(target=_run, daemon=True, name="wb-stations-balance").start()
+
+
+# ---- 签到（可配置接口 + 每日自动调用） --------------------------------
+
+def set_checkin_url(st_id, checkin_url):
+    with _LOCK:
+        st = _find(st_id)
+        if not st:
+            return None
+        st["checkin_url"] = str(checkin_url or "").strip()
+        st.pop("last_checkin", None)
+        save()
+        return st
+
+
+def checkin(st_id):
+    """调用站点配置的签到接口（GET + Bearer 鉴权）。返回 (ok, message)。"""
+    with _LOCK:
+        st = _find(st_id)
+        snap = json.loads(json.dumps(st)) if st else None
+    if not snap:
+        return (False, "站点不存在")
+    url = str(snap.get("checkin_url") or "").strip()
+    if not url:
+        return (False, "未配置签到地址")
+    try:
+        headers = {"Accept": "application/json"}
+        key = snap.get("api_key") or ""
+        if key:
+            headers["Authorization"] = "Bearer " + key
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=BALANCE_TIMEOUT) as resp:
+            body = resp.read(256 * 1024).decode("utf-8", "replace")
+        msg = body[:200]
+        with _LOCK:
+            st = _find(st_id)
+            if st:
+                st["last_checkin"] = {"at": time.time(), "ok": True, "resp": msg}
+                save()
+        _logmsg("stations   : 签到 %s -> ok" % snap.get("name"))
+        return (True, msg)
+    except urllib.error.HTTPError as exc:
+        with _LOCK:
+            st = _find(st_id)
+            if st:
+                st["last_checkin"] = {"at": time.time(), "ok": False,
+                                      "resp": "HTTP %d" % exc.code}
+                save()
+        return (False, "HTTP %d" % exc.code)
+    except Exception as exc:
+        with _LOCK:
+            st = _find(st_id)
+            if st:
+                st["last_checkin"] = {"at": time.time(), "ok": False,
+                                      "resp": str(exc)[:120]}
+                save()
+        return (False, str(exc)[:120])
+
+
+def _daily_checkin_loop():
+    """每日 08:00 后对所有配置了签到地址的站点执行一次签到。"""
+    _CHECKIN_HOUR = int(os.environ.get("WB_STATIONS_CHECKIN_HOUR", "8"))
+    done_dates = {}
+    while True:
+        try:
+            now = time.localtime()
+            today = time.strftime("%Y-%m-%d", now)
+            if now.tm_hour >= _CHECKIN_HOUR and done_dates.get("date") != today:
+                done_dates["date"] = today
+                with _LOCK:
+                    targets = [s["id"] for s in _STATIONS
+                               if s.get("enabled") and str(s.get("checkin_url") or "").strip()]
+                for sid in targets:
+                    checkin(sid)
+                if targets:
+                    _logmsg("stations   : 每日自动签到完成（%d 个站点）" % len(targets))
+        except Exception:
+            pass
+        time.sleep(1800)  # 每半小时检查一次
+
+
+def start_daily_checkin():
+    threading.Thread(target=_daily_checkin_loop, daemon=True,
+                     name="wb-stations-checkin").start()
+
