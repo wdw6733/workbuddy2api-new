@@ -121,6 +121,7 @@ def add_station(name, base_url, api_key, enabled=True, priority=0, checkin_url="
         "checkin_user_id": "",
         "login_username": str(login_username or "").strip(),
         "login_password": str(login_password or "").strip(),
+        "session_cookie": "",
         "priority": priority,
         "models_selected": [],
         "models_all": [],
@@ -136,7 +137,7 @@ def add_station(name, base_url, api_key, enabled=True, priority=0, checkin_url="
 def update_station(st_id, name=None, base_url=None, api_key=None, enabled=None,
                    checkin_url=None, priority=None, checkin_method=None,
                    checkin_token=None, checkin_user_id=None,
-                   login_username=None, login_password=None):
+                   login_username=None, login_password=None, session_cookie=None):
     """更新站点；api_key 传 None 或空串表示保留原值。返回更新后的站点或 None。"""
     with _LOCK:
         st = _find(st_id)
@@ -171,6 +172,8 @@ def update_station(st_id, name=None, base_url=None, api_key=None, enabled=None,
             st["login_username"] = str(login_username).strip()
         if login_password is not None and str(login_password).strip():
             st["login_password"] = str(login_password).strip()
+        if session_cookie is not None and str(session_cookie).strip():
+            st["session_cookie"] = str(session_cookie).strip()
         # 地址或密钥变了，旧测活结果不再可信
         st["status"] = _station_default_status()
         st["models_all"] = []
@@ -541,6 +544,8 @@ def view():
             item["login_username"] = st.get("login_username") or ""
             item["login_password_set"] = bool(str(st.get("login_password") or "").strip())
             item.pop("login_password", None)
+            item["session_cookie_set"] = bool(str(st.get("session_cookie") or "").strip())
+            item.pop("session_cookie", None)
             item["last_checkin"] = st.get("last_checkin")
             out.append(item)
         return out
@@ -664,14 +669,21 @@ def set_checkin_url(st_id, checkin_url):
 def _user_api_headers(st):
     """用户级接口（签到/余额）的请求头。
 
-    New API / One API 系站点的 /api/user/* 需要「系统访问令牌」（个人设置里
-    生成，非 sk- API Key）+ New-Api-User: <用户ID> 头。令牌优先取站点配置的
-    checkin_token，没有则回退 api_key（兼容少数用 API Key 鉴权的站）。
+    支持三种鉴权（按优先级）：
+      1. session cookie —— OAuth 登录站（AnyRouter / AgentRouter 等）专用，
+         登录后浏览器里的 session cookie + New-Api-User 头
+      2. 系统访问令牌 —— New API 系的 checkin_token（个人设置生成）
+      3. API Key —— 少数用 sk- 鉴权的站
     """
     headers = {"Accept": "application/json", "User-Agent": _BROWSER_UA}
-    token = str(st.get("checkin_token") or "").strip() or str(st.get("api_key") or "").strip()
-    if token:
-        headers["Authorization"] = "Bearer " + token
+    cookie = str(st.get("session_cookie") or "").strip()
+    if cookie:
+        # 用户填了纯 session 值 → 拼成 session=xxx；填了完整 cookie 头 → 原样用
+        headers["Cookie"] = cookie if ("=" in cookie and (";" in cookie or cookie.startswith("session="))) else ("session=" + cookie)
+    else:
+        token = str(st.get("checkin_token") or "").strip() or str(st.get("api_key") or "").strip()
+        if token:
+            headers["Authorization"] = "Bearer " + token
     uid = str(st.get("checkin_user_id") or "").strip()
     if uid:
         headers["New-Api-User"] = uid
