@@ -55,7 +55,12 @@ jobs:
         # The suites are independent processes (own temp dirs, spare ports), so
         # they overlap; each one's full output is kept on disk next to its
         # summary line.
-        run: python tests/run_all.py --jobs 4 --logs suite-logs
+        #
+        # 跑完后把 run_all.py 的 "failed: a, b, c" 一行转成 ::error:: 注解：
+        # 失败时不用下载 artifact、也不用登录，直接在看板/check-runs 注解里
+        # 就能看到是哪几个套件红的。
+        run: |
+          python -c "import subprocess,sys; p=subprocess.run([sys.executable,'tests/run_all.py','--jobs','4','--logs','suite-logs'],capture_output=True,text=True,encoding='utf-8',errors='replace'); sys.stdout.write(p.stdout or ''); sys.stdout.write(p.stderr or ''); [print('::error::'+l.strip()) for l in (p.stdout or '').splitlines() if l.strip().startswith('failed:')]; sys.exit(p.returncode)"
       - name: Check the suites left the checkout clean
         # A passing run has to prove it stayed inside its temporary directories:
         # a suite that writes into the checkout otherwise fails nothing and is
