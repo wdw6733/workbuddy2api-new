@@ -135,18 +135,30 @@ def _click_turnstile(page):
 
 
 def _launch(kind, profile, headless):
-    """起一个持久化浏览器上下文。cloakbrowser 与 playwright 的签名不同，分开处理。"""
+    """起一个持久化浏览器上下文。cloakbrowser 与 playwright 的签名不同，分开处理。
+
+    容器里通常以 root 运行，Chromium 的沙箱在 root 下起不来，必须加 --no-sandbox
+    （容器本身就是隔离边界，这里不额外损失什么）。
+    """
+    extra = []
+    try:
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            extra.append("--no-sandbox")
+    except Exception:
+        pass
     if kind == "cloakbrowser":
         mod = _load_cloak()
-        return mod.launch_persistent_context(
-            profile, headless=headless, humanize=True, human_preset="careful",
-            viewport={"width": 1920, "height": 1080})
+        kwargs = {"headless": headless, "humanize": True, "human_preset": "careful",
+                  "viewport": {"width": 1920, "height": 1080}}
+        if extra:
+            kwargs["args"] = extra
+        return mod.launch_persistent_context(profile, **kwargs)
     mod = _load_playwright()
     pw = mod.sync_playwright().start()
     return pw.chromium.launch_persistent_context(
         profile, headless=headless,
-        args=["--no-sandbox", "--disable-dev-shm-usage",
-              "--disable-blink-features=AutomationControlled"],
+        args=extra + ["--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled"],
         viewport={"width": 1366, "height": 820}, locale="zh-CN")
 
 
