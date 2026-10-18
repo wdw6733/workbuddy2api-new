@@ -14859,13 +14859,33 @@ async function loadStations(showToast){
     const data = await getJSON('/stations');
     STATIONS_DATA = data.stations || [];
     renderStations();
-    renderStationSolver(data.solver || null);
+    // 提示行是锦上添花：它出错不该把整个站点列表一起带崩
+    try { renderStationSolver(data.solver || null); } catch(e) { console.warn(e); }
   } catch(e){
-    if(tbody) tbody.innerHTML = '<tr><td colspan="5" style="color:var(--bad);text-align:center;padding:18px">加载失败：' + esc(e.message) + '</td></tr>';
+    if(tbody) tbody.innerHTML = '<tr><td colspan="6" style="color:var(--bad);text-align:center;padding:18px">加载失败：' + esc(e.message) + '</td></tr>';
     if(showToast) toast('公益站加载失败：' + e.message, 'bad');
   } finally {
     STATIONS_LOADING = false;
   }
+}
+
+// 签到能力提示：告诉用户人机验证站点现在会怎么处理
+//   configured -> 配了打码 key，可全自动
+//   browser    -> 镜像带浏览器，会自动尝试浏览器签到
+//   都不是     -> 点「签到」后弹窗用本机浏览器过验证
+function renderStationSolver(solver){
+  const el = document.getElementById('stationsHint');
+  if(!el) return;
+  const base = '同名模型自动合并；多站共享时按「优先级 + 延迟」选站，失败自动切换。';
+  let extra;
+  if(solver && solver.configured){
+    extra = '｜打码服务已启用（' + (solver.provider || 'capsolver') + '），人机验证站点可全自动签到。';
+  } else if(solver && solver.browser){
+    extra = '｜镜像带浏览器，人机验证站点会自动尝试浏览器签到。';
+  } else {
+    extra = '｜人机验证站点：点「签到」后在弹窗里用本机浏览器过验证即可。';
+  }
+  el.textContent = base + extra;
 }
 
 function stationStateBadge(st){
