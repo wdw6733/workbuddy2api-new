@@ -1088,33 +1088,100 @@ _FAIL_WORDS = ("未登录", "未提供", "无权", "无权限", "失败", "错�
 
 # 真正「签到入账」才会出现的奖励字段
 _CHECKIN_REWARD_KEYS = ("checkin_quota", "quota", "reward", "added_quota",
-                        "credit", "points", "checkin_reward", "checkinQuota")
-# 「签到状态查询」返回里常见的字段：出现这些说明接口只回了状态，没执行签到
-_CHECKIN_STATUS_KEYS = ("checked_in", "checkedIn", "today_checked", "is_checkin",
-                        "is_checkin_today", "checkin_date", "checked", "check_in")
+                        "credit", "points", "checkin_reward", "checkinQuota",
+                        "quota_awarded", "awarded_quota", "checkin_quota_awarded")
+# 「今天是否已签到」的布尔标记（各家写法不一，且常常嵌在 data.stats 里）
+_CHECKIN_TODAY_KEYS = ("checked_in_today", "checkedInToday", "today_checked",
+                       "is_checkin_today", "isCheckinToday", "checkin_today",
+                       "checked_in", "checkedIn", "is_checkin", "checked")
 
 
-def _checkin_evidence(data):
+def _walk_dicts(obj, depth=0, limit=4):
+    """递归遍历响应里的所有 dict（深度受限），用于找嵌套的状态字段。"""
+    if depth > limit:
+        return
+    if isinstance(obj, dict):
+        yield obj
+        for value in obj.values():
+            for item in _walk_dicts(value, depth + 1, limit):
+                yield item
+    elif isinstance(obj, list):
+        for value in obj[:5]:
+            for item in _walk_dicts(value, depth + 1, limit):
+                yield item
+
+
+def _checkin_stats(data):
+    """从签到响应里取出 (今天是否已签, 累计次数, 今日奖励配额)。
+
+    真实站点的状态是嵌套的，例如：
+        {"data": {"enabled": true, "max_quota": 10000000,
+                  "stats": {"checked_in_today": true, "checkin_count": 4,
+                            "records": [{"checkin_date": "2026-10-18",
+                                         "quota_awarded": 1234567}]}}}
+    所以不能只看 data 顶层，要递归找。
+    """
+    checked = None
+    count = None
+    reward = ""
+    today = time.strftime("%Y-%m-%d")
+    for node in _walk_dicts(data):
+        if checked is None:
+            for key in _CHECKIN_TODAY_KEYS:
+                if isinstance(node.get(key), bool):
+                    checked = node[key]
+                    break
+        if count is None and isinstance(node.get("checkin_count"), int):
+            count = node["checkin_count"]
+        records = node.get("records")
+        if isinstance(records, list):
+            for rec in records:
+                if not isinstance(rec, dict):
+                    continue
+                day = str(rec.get("checkin_date") or rec.get("date") or "")[:10]
+                if day != today:
+                    continue
+                if checked is None:
+                    checked = True          # 今天有记录 = 已签到
+                for key in _CHECKIN_REWARD_KEYS:
+                    if rec.get(key) not in (None, "", 0, "0"):
+                        reward = str(rec[key])
+                        break
+                break
+    return checked, count, reward
+
+
+def _checkin_evidence(data, stats=None, is_action=False):
     """判定响应属于哪一种：
 
     - ``confirmed`` 真的签到入账（带奖励字段 / 明确的成功文案）
     - ``already``   今天已经签过（状态是好的，但没有新增收益）
     - ``status``    只回了签到状态或空壳 success（**没执行签到**）
     - ``none``      有文案但既不是成功也不是已签到
+
+    is_action=True 表示这次请求本身就是「执行签到」（POST），此时状态里
+    checked=True 可以视为刚刚签到成功。
     """
     if not isinstance(data, dict):
         return "none"
+    checked, _count, reward = stats if stats is not None else _checkin_stats(data)
     msg = str(data.get("message") or data.get("msg") or "").strip()
     low = msg.lower()
     payload = data.get("data")
+    # 1. 明确的「今天已签到」状态最可信
+    if checked is True:
+        return "confirmed" if is_action else "already"
+    # 2. 带奖励字段 = 真的入账
+    if reward:
+        return "confirmed"
     if isinstance(payload, dict):
         for key in _CHECKIN_REWARD_KEYS:
-            v = payload.get(key)
-            if v not in (None, "", 0, "0"):
+            if payload.get(key) not in (None, "", 0, "0"):
                 return "confirmed"
-        for key in _CHECKIN_STATUS_KEYS:
-            if key in payload:
-                return "status"
+    # 3. 明确「今天还没签」= 只是状态查询
+    if checked is False:
+        return "status"
+    # 4. 文案判断
     if any(w in msg or w in low for w in _ALREADY_CHECKED):
         return "already"
     if any(w in msg for w in ("签到成功", "签到获得", "签到奖励", "已获得")):
@@ -1123,13 +1190,14 @@ def _checkin_evidence(data):
         return "confirmed"
     if msg:
         return "none"
-    # 既无文案也无 data —— 典型的「状态查询」空壳响应，
-    # 面板以前就是在这里误报「签到成功」的。
+    # 既无文案也无 data —— 空壳 success，当作状态查询
     return "status"
 
 
-def _checkin_reward(data):
+def _checkin_reward(data, stats=None):
     """从响应里取签到奖励配额（取不到返回空串）。"""
+    if stats is not None and stats[2]:
+        return stats[2]
     payload = data.get("data") if isinstance(data, dict) else None
     if isinstance(payload, dict):
         for key in _CHECKIN_REWARD_KEYS:
@@ -1141,7 +1209,15 @@ def _checkin_reward(data):
     return ""
 
 
-def _checkin_interpret(body, status=200):
+def _already_message(stats=None):
+    """「今天已签到」的文案：带上站点的累计次数，让人一眼看出是真签过。"""
+    count = stats[1] if stats else None
+    if isinstance(count, int) and count > 0:
+        return "今天已签到（站点累计 %d 次）" % count
+    return "今天已签到（无需重复）"
+
+
+def _checkin_interpret(body, status=200, is_action=False):
     """解析签到响应，返回 (ok, message, evidence)。
 
     只认 HTTP 2xx 会把两种「假成功」当成签到成功，面板提示成功、站内却没有
@@ -1149,8 +1225,12 @@ def _checkin_interpret(body, status=200):
       1. HTTP 200 + {"success": false, "message": "无权进行此操作..."}
       2. HTTP 200 + {"success": true}（空壳，其实是签到状态查询的响应）
 
-    所以除了 success，还要看**有没有签到证据**：带奖励字段或明确成功文案才算
-    ``confirmed``；空壳 success 记成 ``status``，由调用方换个方法/地址再试。
+    所以除了 success，还要看**有没有签到证据**：带奖励字段、明确的成功文案，
+    或者状态里 checked_in_today 为真才算 ``confirmed``；明确「今天还没签」或
+    空壳 success 记成 ``status``，由调用方换个方法/地址再试。
+
+    is_action=True 表示这次请求本身是「执行签到」（POST），此时状态里的
+    checked_in_today=True 就可以直接视为签到成功。
     """
     text = (body or "").strip()
     if not text:
@@ -1163,7 +1243,7 @@ def _checkin_interpret(body, status=200):
         data = json.loads(text)
     except Exception:
         if any(w in text or w in low for w in _ALREADY_CHECKED):
-            return (True, "今天已签到（无需重复）", "already")
+            return (True, _already_message(), "already")
         if any(w in text or w in low for w in _FAIL_WORDS):
             return (False, text[:120], "none")
         return (True, text[:120], "none")
@@ -1171,22 +1251,25 @@ def _checkin_interpret(body, status=200):
         return (True, text[:120], "none")
     ok = data.get("success")
     msg = str(data.get("message") or data.get("msg") or "").strip()
-    evidence = _checkin_evidence(data)
+    stats = _checkin_stats(data)
+    evidence = _checkin_evidence(data, stats, is_action=is_action)
     if ok is False:
-        if evidence == "already":
-            return (True, "今天已签到（无需重复）", "already")
+        if evidence in ("already", "confirmed"):
+            return (True, _already_message(stats), "already")
         return (False, msg or "站点拒绝了签到请求", "none")
     if ok is True:
         if evidence == "already":
-            return (True, "今天已签到（无需重复）", "already")
-        reward = _checkin_reward(data)
+            return (True, _already_message(stats), "already")
+        reward = _checkin_reward(data, stats)
         out = msg or ("签到成功" if evidence == "confirmed" else "站点返回成功")
         if reward:
             out += "（配额 +%s）" % reward
         return (True, out, evidence)
     # 没有 success 字段：按文案判断
     if evidence == "already":
-        return (True, "今天已签到（无需重复）", "already")
+        return (True, _already_message(stats), "already")
+    if evidence == "confirmed":
+        return (True, msg[:120] or "签到成功", "confirmed")
     if any(w in msg or w in msg.lower() for w in _FAIL_WORDS):
         return (False, msg[:120] or "签到失败", "none")
     return (True, msg[:120] or "站点返回成功", evidence)
@@ -1205,16 +1288,50 @@ def _checkin_url_variants(url):
     return out
 
 
+def _checkin_status_probe(snap, urls, styles):
+    """GET 站点的签到状态，返回 (checked, stats, raw, url)。
+
+    checked 为 True/False/None（None = 该接口不返回状态字段）。
+    用于两件事：签之前先看今天签没签（避免重复签到），签之后再复核一次。
+    """
+    for try_url in urls:
+        for style in styles:
+            try:
+                req = urllib.request.Request(
+                    try_url, headers=_user_api_headers(snap, style), method="GET")
+                with urllib.request.urlopen(req, timeout=BALANCE_TIMEOUT) as resp:
+                    raw = resp.read(256 * 1024).decode("utf-8", "replace")
+            except urllib.error.HTTPError as exc:
+                if exc.code in (401, 403):
+                    continue          # 换鉴权写法
+                break                 # 这个地址没有状态查询能力
+            except Exception:
+                break
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+            stats = _checkin_stats(data)
+            if stats[0] is not None:
+                return (stats[0], stats, raw, try_url)
+        # 这个地址不带状态字段，换下一个地址写法
+    return (None, None, "", "")
+
+
 def checkin(st_id):
     """调用站点签到接口，返回 (ok, message, raw_body)。
 
     签到接口在不同 fork 上差异很大：`/checkin` 与 `/check_in`、GET 与 POST，
-    而且**有的 GET 只查今天是否已签（回一个空壳 `{"success":true}`），POST 才
-    真正入账**——这正是「面板报签到成功、站内却没有记录」的根源。
+    而且很多站点的 **GET 只查今天签没签、POST 才真正入账**——这正是「面板报
+    签到成功、站内却没有记录」的根源。
 
-    所以这里按「方法 × 地址 × 鉴权写法」逐个尝试，并且**只认带签到证据的
-    响应**（奖励字段 / 明确的成功文案）。空壳 success 记为未确认，换下一种
-    方法继续试；全部试完仍未确认就如实返回失败，不再谎报成功。
+    因此按这个顺序走：
+      1. 先 GET 查状态：今天已签就直接返回「已签到」，**不发签到动作**，
+         避免重复签到刷出一堆记录；
+      2. 未签（或查不到状态）才执行签到动作，按「方法 × 地址 × 鉴权写法」
+         逐个尝试，只认带签到证据（奖励字段 / checked_in_today / 明确文案）的响应；
+      3. 动作做完再复核一次状态，确认真的入账；
+      4. 全部试完仍未确认，就如实返回失败并附上原始返回，不再谎报成功。
     """
     with _LOCK:
         st = _find(st_id)
@@ -1224,10 +1341,10 @@ def checkin(st_id):
     url = str(snap.get("checkin_url") or "").strip()
     if not url:
         return (False, "未配置签到地址", "")
-    configured = str(snap.get("checkin_method") or "GET").upper()
+    configured = str(snap.get("checkin_method") or "POST").upper()
     if configured not in ("GET", "POST"):
-        configured = "GET"
-    # 先按配置的方法试；拿不到签到证据再换另一种（GET 常常只是查状态）
+        configured = "POST"
+    # 执行动作时先按配置的方法，再试另一种
     methods = [configured] + [m for m in ("POST", "GET") if m != configured]
     urls = _checkin_url_variants(url)
     styles = _auth_styles(snap)
@@ -1235,20 +1352,30 @@ def checkin(st_id):
     last_error = ""
     raw = ""
     fallback = None          # (msg, body, url, method)：成功但没签到证据
-    attempts = 0
-    max_attempts = 6
 
     def _record(ok, msg, extra=None):
         with _LOCK:
             st = _find(st_id)
             if st:
                 rec = {"at": time.time(), "ok": bool(ok), "message": msg,
-                       "resp": (raw or "")[:400]}
+                       "resp": (raw or "")[:2000]}
                 if extra:
                     rec.update(extra)
                 st["last_checkin"] = rec
                 save()
 
+    # ---- 1. 先查状态 ----
+    checked, stats, status_raw, status_url = _checkin_status_probe(snap, urls, styles)
+    if checked is True:
+        raw = status_raw
+        msg = _already_message(stats)
+        _record(True, msg, {"url": status_url, "method": "GET", "phase": "status"})
+        _logmsg("stations   : 签到 %s -> 已签到，跳过动作 (%s)" % (snap.get("name"), msg))
+        return (True, msg, raw)
+
+    # ---- 2. 执行签到动作 ----
+    attempts = 0
+    max_attempts = 6
     for method in methods:
         method_done = False
         for try_url in urls:
@@ -1283,17 +1410,17 @@ def checkin(st_id):
                     last_error = str(exc)[:120]
                     break
 
-                ok, msg, evidence = _checkin_interpret(raw, status)
+                ok, msg, evidence = _checkin_interpret(
+                    raw, status, is_action=(method == "POST"))
                 if ok and evidence in ("confirmed", "already"):
                     _record(True, msg, {"url": try_url, "method": method,
-                                        "auth": style})
+                                        "auth": style, "phase": "action"})
                     _logmsg("stations   : 签到 %s -> ok (%s) %s %s resp=%s"
                             % (snap.get("name"), msg, method, try_url, raw[:400]))
                     return (True, msg, raw)
                 if ok:
-                    # 成功但没证据：空壳 success / 只回了签到状态。
-                    # 地址是通的（能返回合法 JSON），问题在方法，换方法即可，
-                    # 不必再试同一方法的另一个地址写法。
+                    # 成功但没证据：空壳 success / 只回了状态。
+                    # 地址是通的（能返回合法 JSON），问题在方法，换方法即可。
                     if fallback is None:
                         fallback = (msg, raw, try_url, method)
                     _logmsg("stations   : 签到 %s -> 无签到证据（%s %s），换方法重试 resp=%s"
@@ -1305,19 +1432,33 @@ def checkin(st_id):
                     continue              # 换鉴权写法
                 break                     # 业务失败，换地址 / 方法
 
+    # ---- 3. 动作后复核状态 ----
+    checked2, stats2, status_raw2, status_url2 = _checkin_status_probe(
+        snap, urls, styles)
+    if checked2 is True:
+        raw = status_raw2 or raw
+        count = stats2[1] if stats2 else None
+        msg = "签到成功" + ("（站点累计 %d 次）" % count if isinstance(count, int) and count else "")
+        _record(True, msg, {"url": status_url2, "method": "GET", "phase": "verify"})
+        _logmsg("stations   : 签到 %s -> ok（动作后复核已签到）%s"
+                % (snap.get("name"), msg))
+        return (True, msg, raw)
+
     if fallback:
         _msg, body, u, m = fallback
-        note = ("站点返回成功但没有签到结果（%s %s）。该地址很可能只查询签到"
-                "状态，真正的签到接口在别处——请在站点上确认是否已签到。"
-                "原始返回：%s" % (m, u, body[:160]))
+        note = ("该接口只返回了签到状态，没有执行签到（%s %s），站点显示今天"
+                "尚未签到。请在站点上点一次「签到」并用 F12 → Network 抓出真正"
+                "的请求地址与方法，填到「签到地址 / 签到方法」里。"
+                "原始返回：%s" % (m, u, body[:400]))
         _record(False, note, {"url": u, "method": m, "unverified": True})
         _logmsg("stations   : 签到 %s -> unverified resp=%s"
-                % (snap.get("name"), body[:300]))
+                % (snap.get("name"), body[:400]))
         return (False, note, body)
 
     _record(False, last_error or "签到失败")
     _logmsg("stations   : 签到 %s -> fail (%s)" % (snap.get("name"), last_error))
     return (False, last_error or "签到失败", raw)
+
 
 
 def _daily_checkin_loop():

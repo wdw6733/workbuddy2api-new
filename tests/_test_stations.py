@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -200,7 +201,53 @@ class CheckinRequestTests(unittest.TestCase):
         with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
             ok, msg, raw = wb_stations.checkin(sid)
         self.assertTrue(ok)
-        self.assertEqual(seen, ["GET", "POST"])
+        # 签到动作最后落在 POST 上
+        self.assertEqual(seen[-1], "POST")
+        self.assertIn("500000", msg)
+
+    def test_nested_checked_in_today_means_already(self):
+        """真实站点把状态嵌在 data.stats 里，必须能认出来并跳过签到动作。"""
+        sid = add()
+        wb_stations.update_station(sid, checkin_url="https://api.example.com/api/user/checkin",
+                                   checkin_method="POST")
+        payload = {"data": {"enabled": True, "max_quota": 10000000,
+                            "min_quota": 1,
+                            "stats": {"checked_in_today": True,
+                                      "checkin_count": 4,
+                                      "records": [{"checkin_date":
+                                                   time.strftime("%Y-%m-%d"),
+                                                   "quota_awarded": 1234567}]}}}
+        seen = []
+
+        def fake_urlopen(req, timeout=None):
+            seen.append(req.get_method())
+            return FakeResponse(payload)
+
+        with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
+            ok, msg, raw = wb_stations.checkin(sid)
+        self.assertTrue(ok)
+        self.assertIn("已签到", msg)
+        self.assertIn("4", msg)
+        # 已经签过就只查状态，不再发签到动作
+        self.assertEqual(seen, ["GET"])
+
+    def test_nested_not_checked_in_triggers_action(self):
+        """状态显示今天没签时，才发签到动作，并在动作后复核。"""
+        sid = add()
+        wb_stations.update_station(sid, checkin_url="https://api.example.com/api/user/checkin",
+                                   checkin_method="POST")
+        state = {"checked": False}
+
+        def fake_urlopen(req, timeout=None):
+            if req.get_method() == "POST":
+                state["checked"] = True
+                return FakeResponse({"success": True, "data": {"checkin_quota": 500000}})
+            return FakeResponse({"data": {"stats": {
+                "checked_in_today": state["checked"], "checkin_count": 5}}})
+
+        with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
+            ok, msg, raw = wb_stations.checkin(sid)
+        self.assertTrue(ok)
         self.assertIn("500000", msg)
 
     def test_bare_success_everywhere_is_not_reported_as_success(self):
@@ -215,7 +262,7 @@ class CheckinRequestTests(unittest.TestCase):
         with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
             ok, msg, raw = wb_stations.checkin(sid)
         self.assertFalse(ok)
-        self.assertIn("没有签到结果", msg)
+        self.assertIn("没有执行签到", msg)
         self.assertFalse(wb_stations.get_station(sid)["last_checkin"]["ok"])
 
     def test_checkin_failure_is_recorded(self):

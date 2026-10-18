@@ -4290,6 +4290,28 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     </div>
   </div>
 
+  <div class="modal-mask" id="stationCheckinModal" onclick="if(event.target===this) closeStationCheckin()">
+    <div class="modal" role="dialog" aria-modal="true" style="width:min(680px,100%)">
+      <div class="modal-hd">
+        <h2>签到详情 <em id="stationCheckinMeta" style="color:var(--dim);font-size:12px;font-style:normal"></em></h2>
+        <button class="modal-x" onclick="closeStationCheckin()" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-bd">
+        <div id="stationCheckinSummary" style="font-size:13px;line-height:1.6;margin-bottom:12px"></div>
+        <div style="font-size:12px;color:var(--dim);margin-bottom:6px">站点原始返回</div>
+        <pre id="stationCheckinRaw" style="max-height:42vh;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-all;margin:0"></pre>
+        <p class="hint" style="margin:10px 0 0">
+          签到失败时看这里：返回里没有「已签到」或奖励字段，说明该地址只查询状态，
+          真正执行签到的接口需要用 F12 → Network 在站点上点一次「签到」抓出来。
+        </p>
+      </div>
+      <div class="modal-ft">
+        <button class="sec" onclick="closeStationCheckin()">关闭</button>
+        <button class="primary" id="stationCheckinRetry" onclick="retryStationCheckin()">重新签到</button>
+      </div>
+    </div>
+  </div>
+
   <div id="pageSettings" class="main-page">
     <div style="margin-bottom:16px">
       <h2 style="margin:0;font-size:17px;color:var(--fg);font-family:var(--serif);font-weight:600;letter-spacing:.02em">网关设置</h2>
@@ -14872,17 +14894,19 @@ function renderStations(){
     // 余额已单独成列，说明里去掉服务端拼的那段，避免重复
     let note = (st.note || '').replace(/｜余额 [^｜]*/g, '');
     if(shared > 0){ note += '｜' + shared + ' 个模型多站共享（自动故障转移）'; }
-    // 最近一次签到结果：只放时间与成败，完整文案放 title
+    // 最近一次签到结果：只放时间与成败；点开可看完整返回（排查接口用）
     const lc = st.last_checkin || null;
-    let lcText = '';
+    let lcHtml = '';
     let lcTitle = '';
     if(lc && lc.at){
       const d = new Date(lc.at * 1000);
       const hh = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
-      lcText = '｜签到' + (lc.ok ? '✓' : '✗') + ' ' + hh;
-      // 悬停看完整文案 + 站点原始返回，签到失败时靠它定位（鉴权 / 已签到 / 维护）
       lcTitle = [lc.message, (lc.resp && lc.resp !== lc.message) ? ('原始返回：' + lc.resp) : '']
         .filter(Boolean).join(' · ');
+      lcHtml = '<span onclick="openStationCheckin(\'' + st.id + '\')" title="' + esc(lcTitle) + '"'
+        + ' style="cursor:pointer;text-decoration:underline dotted;'
+        + 'color:' + (lc.ok ? 'var(--ok,#16a34a)' : 'var(--bad,#dc2626)') + '">'
+        + '｜签到' + (lc.ok ? '✓' : '✗') + ' ' + hh + '</span>';
     }
     html += '<tr>' +
       '<td><div style="font-weight:600">' + esc(st.name) +
@@ -14892,7 +14916,7 @@ function renderStations(){
       '<td>' + stationStateBadge(st) + '</td>' +
       '<td>' + stationLatency(st) + '</td>' +
       '<td>' + stationBalanceCell(st) + '</td>' +
-      '<td style="max-width:300px" title="' + esc(lcTitle) + '">' + esc(note + lcText) + '</td>' +
+      '<td style="max-width:300px">' + esc(note) + lcHtml + '</td>' +
       '<td><div style="display:flex;gap:6px;flex-wrap:wrap">' +
         '<button class="sec mini" onclick="probeStation(\'' + st.id + '\')">测活</button>' +
         '<button class="sec mini" onclick="openStationModels(\'' + st.id + '\')">选模型</button>' +
@@ -15081,6 +15105,64 @@ async function checkinStation(id){
     toast('签到失败：' + e.message, 'bad');
   } finally {
     if(btn){ btn.disabled = false; btn.textContent = '签到'; }
+  }
+}
+
+// 签到详情：把站点原始返回完整摊开，排查「接口不对」时不用翻容器日志
+let _stationCheckinTarget = null;
+
+function openStationCheckin(id){
+  const st = stationById(id);
+  if(!st) return;
+  _stationCheckinTarget = id;
+  document.getElementById('stationCheckinMeta').textContent = st.name;
+  const lc = st.last_checkin || null;
+  const box = document.getElementById('stationCheckinSummary');
+  if(!lc || !lc.at){
+    box.innerHTML = '<span style="color:var(--dim)">还没有签到记录，点「重新签到」试一次。</span>';
+  } else {
+    const d = new Date(lc.at * 1000);
+    const okColor = lc.ok ? 'var(--ok,#16a34a)' : 'var(--bad,#dc2626)';
+    let h = '<div><b style="color:' + okColor + '">' + (lc.ok ? '签到成功' : '签到未生效') + '</b>'
+          + ' · ' + esc(d.toLocaleString()) + '</div>';
+    if(lc.message) h += '<div style="margin-top:6px">' + esc(lc.message) + '</div>';
+    const meta = [];
+    if(lc.method) meta.push(lc.method);
+    if(lc.url) meta.push(lc.url);
+    if(lc.auth) meta.push('鉴权 ' + lc.auth);
+    if(lc.phase) meta.push('阶段 ' + lc.phase);
+    if(meta.length){
+      h += '<div style="margin-top:6px;color:var(--dim);font-size:12px;word-break:break-all">'
+         + esc(meta.join(' · ')) + '</div>';
+    }
+    box.innerHTML = h;
+  }
+  const raw = (lc && lc.resp) || '';
+  let pretty = raw;
+  try { pretty = JSON.stringify(JSON.parse(raw), null, 2); } catch(e) {}
+  document.getElementById('stationCheckinRaw').textContent = pretty || '（站点没有返回内容）';
+  document.getElementById('stationCheckinModal').classList.add('show');
+}
+function closeStationCheckin(){
+  document.getElementById('stationCheckinModal').classList.remove('show');
+}
+async function retryStationCheckin(){
+  const id = _stationCheckinTarget;
+  if(!id) return;
+  const btn = document.getElementById('stationCheckinRetry');
+  if(btn){ btn.disabled = true; btn.textContent = '签到中…'; }
+  try {
+    const r = await postJSON('/stations/checkin', { id: id });
+    const st = stationById(id);
+    const who = st ? st.name : '站点';
+    if(r.ok){ toast(who + ' 签到：' + (r.message || '成功'), 'ok'); }
+    else { toast(who + ' 签到未生效：' + (r.message || '未知原因'), 'bad'); }
+    await loadStations();
+    if(stationById(id)) openStationCheckin(id);
+  } catch(e){
+    toast('签到失败：' + e.message, 'bad');
+  } finally {
+    if(btn){ btn.disabled = false; btn.textContent = '重新签到'; }
   }
 }
 
