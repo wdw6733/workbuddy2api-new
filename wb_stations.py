@@ -1317,12 +1317,42 @@ def _with_query(url, **params):
 
 
 def _mark_turnstile(st_id, flag):
-    """记录/清除「该站点签到需要人机验证」的标记（每日自动签到会跳过）。"""
+    """记录/清除「该站点签到需要人机验证」的标记（每日自动签到会走浏览器）。"""
     with _LOCK:
         st = _find(st_id)
         if st and bool(st.get("needs_turnstile")) != bool(flag):
             st["needs_turnstile"] = bool(flag)
             save()
+
+
+def _browser_available():
+    """当前镜像里有没有可用的无头浏览器（playwright + chromium）。"""
+    try:
+        import wb_browser
+        return bool(wb_browser.available())
+    except Exception:
+        return False
+
+
+def _browser_checkin(snap):
+    """用无头浏览器跑站点自己的签到流程。
+
+    返回 (ok, message, raw)；当前环境没有 playwright 时返回 None，
+    调用方就退回纯 HTTP 逻辑（并提示只能手动签到）。
+    """
+    try:
+        import wb_browser
+    except Exception:
+        return None
+    try:
+        if not wb_browser.available():
+            return None
+    except Exception:
+        return None
+    try:
+        return wb_browser.checkin(snap, accounts_dir=_accounts_dir(), log=_logmsg)
+    except Exception as exc:
+        return (False, "浏览器签到异常: %s" % str(exc)[:140], "")
 
 
 def _checkin_url_variants(url):
@@ -1430,6 +1460,19 @@ def checkin(st_id, turnstile=None):
         _logmsg("stations   : 签到 %s -> 已签到，跳过动作 (%s)" % (snap.get("name"), msg))
         return (True, msg, raw)
 
+    # ---- 1.5 已知需要人机验证：直接交给无头浏览器，省掉必然失败的 HTTP 动作 ----
+    if snap.get("needs_turnstile"):
+        res = _browser_checkin(snap)
+        if res:
+            bok, bmsg, braw = res
+            if bok:
+                _mark_turnstile(st_id, False)
+                _record(True, bmsg, {"phase": "browser"})
+                _logmsg("stations   : 签到 %s -> ok（浏览器）%s"
+                        % (snap.get("name"), bmsg))
+                return (True, bmsg, braw)
+            _logmsg("stations   : 浏览器签到未成功（%s），回退 HTTP 再试" % bmsg)
+
     # ---- 2. 执行签到动作 ----
     attempts = 0
     max_attempts = 6
@@ -1477,12 +1520,24 @@ def checkin(st_id, turnstile=None):
                             % (snap.get("name"), msg, method, try_url, raw[:400]))
                     return (True, msg, raw)
                 if evidence == "turnstile":
-                    # 人机验证是硬性门槛，换方法/地址都没用，直接收工
+                    # 人机验证是硬性门槛，换方法/地址都没用：交给无头浏览器
                     _mark_turnstile(st_id, True)
-                    _record(False, msg, {"url": try_url, "method": method,
-                                         "turnstile_required": True})
                     _logmsg("stations   : 签到 %s -> 需要 Turnstile（%s %s）resp=%s"
                             % (snap.get("name"), method, try_url, raw[:200]))
+                    res = _browser_checkin(snap)
+                    if res:
+                        bok, bmsg, braw = res
+                        if bok:
+                            _mark_turnstile(st_id, False)
+                            _record(True, bmsg, {"phase": "browser"})
+                            _logmsg("stations   : 签到 %s -> ok（浏览器）%s"
+                                    % (snap.get("name"), bmsg))
+                            return (True, bmsg, braw)
+                        _record(False, bmsg, {"phase": "browser",
+                                              "turnstile_required": True})
+                        return (False, bmsg, braw or raw)
+                    _record(False, msg, {"url": try_url, "method": method,
+                                         "turnstile_required": True})
                     return (False, msg, raw)
                 if ok:
                     # 成功但没证据：空壳 success / 只回了状态。
@@ -1537,19 +1592,22 @@ def _daily_checkin_loop():
             today = time.strftime("%Y-%m-%d", now)
             if now.tm_hour >= _CHECKIN_HOUR and done_dates.get("date") != today:
                 done_dates["date"] = today
+                has_browser = _browser_available()
                 with _LOCK:
-                    targets = [s["id"] for s in _STATIONS
-                               if s.get("enabled")
-                               and str(s.get("checkin_url") or "").strip()]
-                    # 需要人机验证的站点自动签到必然失败，跳过并只提示一次
-                    skipped = [s.get("name") for s in _STATIONS
-                               if s.get("enabled") and s.get("needs_turnstile")]
+                    rows = [(s["id"], s.get("name"), bool(s.get("needs_turnstile")))
+                            for s in _STATIONS
+                            if s.get("enabled")
+                            and str(s.get("checkin_url") or "").strip()]
+                # 需要人机验证的站点：镜像里带浏览器才排进来，否则跳过并提示一次
+                targets = [sid for sid, _n, need in rows if has_browser or not need]
+                skipped = [n for _sid, n, need in rows if need and not has_browser]
                 for sid in targets:
                     checkin(sid)
                 if targets:
                     _logmsg("stations   : 每日自动签到完成（%d 个站点）" % len(targets))
                 if skipped:
-                    _logmsg("stations   : 跳过 %d 个需要人机验证的站点（请手动签到）：%s"
+                    _logmsg("stations   : 跳过 %d 个需要人机验证的站点"
+                            "（当前镜像没有浏览器，请用 :browser 镜像或手动签到）：%s"
                             % (len(skipped), "、".join(str(n) for n in skipped)))
         except Exception:
             pass

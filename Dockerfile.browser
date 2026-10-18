@@ -1,0 +1,47 @@
+# WorkBuddy Gateway —— 带无头浏览器的镜像
+#
+# 用途：给「签到强制 Cloudflare Turnstile」的公益站（如幻城网安 api.hcnsec.cn）
+# 做自动签到。Turnstile 的 token 只能由真实浏览器里的 JS 算出来，纯 HTTP 拿不到，
+# 所以这条路径必须真的跑一个 Chromium：打开站点页面 → 让页面自己解 Turnstile →
+# 点它自己的「签到」按钮 → 截获签到接口的响应。
+#
+# 代价：镜像从 ~63MB 涨到 ~1GB。所以它单独打 :browser 标签，主镜像保持精简；
+# 用哪个由 docker-compose 里的 image 决定。
+#
+# 主镜像（python:3.11-alpine）装不了 Chromium（musl），所以这里用 slim。
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    HOST=0.0.0.0 \
+    PORT=8788 \
+    API_KEY= \
+    TZ=Asia/Shanghai
+
+WORKDIR /app
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tzdata ca-certificates \
+ && cp /usr/share/zoneinfo/${TZ} /etc/localtime \
+ && echo "${TZ}" > /etc/timezone \
+ && rm -rf /var/lib/apt/lists/*
+
+# Playwright + Chromium（--with-deps 会把 Chromium 需要的系统库一并装上）
+RUN pip install --no-cache-dir playwright \
+ && python -m playwright install --with-deps chromium \
+ && rm -rf /root/.cache/ms-playwright/*.zip
+
+# 应用本体（零外部依赖，直接跑源码）
+COPY wb_*.py dashboard.html ./
+
+RUN mkdir -p /app/accounts /app/usage
+
+# accounts 里会多一个 browser/ 目录：每个站点一个持久化 profile，
+# 登录态与 Cloudflare cookie 留在里面，跨天复用，不用每天重新登录。
+VOLUME ["/app/accounts", "/app/usage"]
+
+EXPOSE 8788
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('PORT','8788'), timeout=3)" || exit 1
+
+CMD ["python", "wb_proxy.py", "--host", "0.0.0.0", "--lan"]

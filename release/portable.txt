@@ -44,6 +44,7 @@ wb_accounts.py
 wb_activity.py
 wb_agents.py
 wb_atrest.py
+wb_browser.py
 wb_catalog.py
 wb_egress.py
 wb_fingerprint.py

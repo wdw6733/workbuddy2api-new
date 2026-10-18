@@ -356,6 +356,50 @@ class StationIdTests(unittest.TestCase):
         self.assertEqual(wb_stations.get_station(b["id"])["models_selected"], ["m-b"])
 
 
+# ---- 浏览器签到（可选依赖） -------------------------------------------
+
+class BrowserCheckinTests(unittest.TestCase):
+    """wb_browser 在没有 playwright 的镜像里必须是「惰性可用」，不能报错。"""
+
+    def test_available_is_false_without_playwright(self):
+        import wb_browser
+        # 主镜像（alpine）不装 playwright；这里只要求不抛异常
+        self.assertIn(wb_browser.available(), (True, False))
+
+    def test_parse_success_payload(self):
+        import wb_browser
+        ok, msg = wb_browser._parse(json.dumps({
+            "data": {"checkin_date": "2026-10-18", "quota_awarded": 2246295},
+            "message": "签到成功", "success": True}))
+        self.assertTrue(ok)
+        self.assertIn("2246295", msg)
+
+    def test_parse_failure_payload(self):
+        import wb_browser
+        ok, msg = wb_browser._parse(json.dumps({
+            "message": "Turnstile token 为空", "success": False}))
+        self.assertFalse(ok)
+        self.assertIn("Turnstile", msg)
+
+    def test_checkin_without_browser_falls_back_to_hint(self):
+        """镜像里没有浏览器时，签到要给出可读的手动提示，而不是崩掉。"""
+        sid = add()
+        wb_stations.update_station(sid, checkin_url="https://api.example.com/api/user/checkin",
+                                   checkin_method="POST")
+
+        def fake_urlopen(req, timeout=None):
+            if req.get_method() == "POST":
+                return FakeResponse({"message": "Turnstile token 为空",
+                                     "success": False})
+            return FakeResponse({"data": {"stats": {"checked_in_today": False}}})
+
+        with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
+            with mock.patch.object(wb_stations, "_browser_checkin", lambda snap: None):
+                ok, msg, raw = wb_stations.checkin(sid)
+        self.assertFalse(ok)
+        self.assertIn("人机验证", msg)
+
+
 # ---- 模型能力字段 -----------------------------------------------------
 
 class ModelCapabilityTests(unittest.TestCase):
