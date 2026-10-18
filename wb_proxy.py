@@ -16833,8 +16833,9 @@ class Handler(BaseHTTPRequestHandler):
             st_id = str(payload.get("id") or "").strip()
             if not st_id:
                 return self._error(400, "id is required", "invalid_request_error")
-            ok, msg = wb_stations.checkin(st_id)
-            return self._json(200, {"ok": ok, "message": msg})
+            ok, msg, raw = wb_stations.checkin(st_id)
+            return self._json(200, {"ok": ok, "message": msg,
+                                    "resp": (raw or "")[:400]})
         if path == "/stations/login":
             st_id = str(payload.get("id") or "").strip()
             if not st_id:

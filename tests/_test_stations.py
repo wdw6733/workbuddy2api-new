@@ -112,35 +112,48 @@ class BalanceUnitsTests(unittest.TestCase):
 
 class CheckinInterpretTests(unittest.TestCase):
 
-    def test_success_true(self):
-        ok, msg = wb_stations._checkin_interpret(
+    def test_success_with_reward_is_confirmed(self):
+        ok, msg, evidence = wb_stations._checkin_interpret(
             json.dumps({"success": True, "message": "",
                         "data": {"quota": 500000}}))
         self.assertTrue(ok)
-        self.assertIn("签到成功", msg)
+        self.assertEqual(evidence, "confirmed")
         self.assertIn("500000", msg)
 
+    def test_bare_success_is_not_confirmed(self):
+        """空壳 {"success": true} 是「签到状态查询」的响应，不能算签到成功。"""
+        ok, msg, evidence = wb_stations._checkin_interpret(
+            json.dumps({"success": True}))
+        self.assertEqual(evidence, "status")
+        self.assertNotIn("签到成功", msg)
+
+    def test_status_payload_is_not_confirmed(self):
+        ok, msg, evidence = wb_stations._checkin_interpret(
+            json.dumps({"success": True, "data": {"checked_in": False}}))
+        self.assertEqual(evidence, "status")
+
     def test_success_false_is_failure(self):
-        ok, msg = wb_stations._checkin_interpret(
+        ok, msg, evidence = wb_stations._checkin_interpret(
             json.dumps({"success": False, "message": "签到接口维护中"}))
         self.assertFalse(ok)
         self.assertEqual(msg, "签到接口维护中")
 
     def test_auth_failure_message_is_surfaced(self):
-        ok, msg = wb_stations._checkin_interpret(
+        ok, msg, evidence = wb_stations._checkin_interpret(
             json.dumps({"success": False,
                         "message": "无权进行此操作，access token 无效"}))
         self.assertFalse(ok)
         self.assertIn("access token", msg)
 
     def test_already_checked_in_is_not_a_failure(self):
-        ok, msg = wb_stations._checkin_interpret(
+        ok, msg, evidence = wb_stations._checkin_interpret(
             json.dumps({"success": False, "message": "今天已经签到过了"}))
         self.assertTrue(ok)
+        self.assertEqual(evidence, "already")
         self.assertIn("已签到", msg)
 
     def test_html_body_means_auth_failed(self):
-        ok, msg = wb_stations._checkin_interpret("<html><body>login</body></html>")
+        ok, msg, evidence = wb_stations._checkin_interpret("<html><body>login</body></html>")
         self.assertFalse(ok)
         self.assertIn("鉴权", msg)
 
@@ -165,10 +178,45 @@ class CheckinRequestTests(unittest.TestCase):
             return FakeResponse({"success": False, "message": "今日已签到"})
 
         with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
-            ok, msg = wb_stations.checkin(sid)
+            ok, msg, raw = wb_stations.checkin(sid)
         self.assertTrue(ok)
         self.assertIn("已签到", msg)
         self.assertTrue(wb_stations.get_station(sid)["last_checkin"]["ok"])
+
+    def test_bare_success_get_falls_back_to_post(self):
+        """GET 只回空壳 success（查状态）时，应改用 POST 真正签到。"""
+        sid = add()
+        wb_stations.update_station(sid, checkin_url="https://api.example.com/api/user/checkin",
+                                   checkin_method="GET")
+        seen = []
+
+        def fake_urlopen(req, timeout=None):
+            seen.append(req.get_method())
+            if req.get_method() == "POST":
+                return FakeResponse({"success": True, "message": "",
+                                     "data": {"checkin_quota": 500000}})
+            return FakeResponse({"success": True})
+
+        with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
+            ok, msg, raw = wb_stations.checkin(sid)
+        self.assertTrue(ok)
+        self.assertEqual(seen, ["GET", "POST"])
+        self.assertIn("500000", msg)
+
+    def test_bare_success_everywhere_is_not_reported_as_success(self):
+        """所有方法都只回空壳 success 时，必须如实报未确认，不能谎报成功。"""
+        sid = add()
+        wb_stations.update_station(sid, checkin_url="https://api.example.com/api/user/checkin",
+                                   checkin_method="GET")
+
+        def fake_urlopen(req, timeout=None):
+            return FakeResponse({"success": True})
+
+        with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
+            ok, msg, raw = wb_stations.checkin(sid)
+        self.assertFalse(ok)
+        self.assertIn("没有签到结果", msg)
+        self.assertFalse(wb_stations.get_station(sid)["last_checkin"]["ok"])
 
     def test_checkin_failure_is_recorded(self):
         sid = add()
@@ -179,7 +227,7 @@ class CheckinRequestTests(unittest.TestCase):
             return FakeResponse({"success": False, "message": "服务异常"})
 
         with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
-            ok, msg = wb_stations.checkin(sid)
+            ok, msg, raw = wb_stations.checkin(sid)
         self.assertFalse(ok)
         rec = wb_stations.get_station(sid)["last_checkin"]
         self.assertFalse(rec["ok"])

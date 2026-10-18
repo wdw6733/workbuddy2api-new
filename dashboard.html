@@ -4230,8 +4230,8 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
           <div style="flex:0 0 110px">
             <div style="font-size:12px;color:var(--dim);margin-bottom:4px">签到方法</div>
             <select id="stationEditCheckinMethod" class="slot-select" style="width:100%">
-              <option value="GET">GET</option>
               <option value="POST">POST</option>
+              <option value="GET">GET</option>
             </select>
           </div>
           <div style="flex:1;min-width:150px">
@@ -14939,7 +14939,7 @@ function openStationEdit(id){
   document.getElementById('stationEditUrl').value = st ? (st.base_url || '') : '';
   document.getElementById('stationEditKey').value = '';
   document.getElementById('stationEditCheckin').value = st ? (st.checkin_url || '') : '';
-  document.getElementById('stationEditCheckinMethod').value = st ? (st.checkin_method || 'GET') : 'GET';
+  document.getElementById('stationEditCheckinMethod').value = st ? (st.checkin_method || 'POST') : 'POST';
   document.getElementById('stationEditCheckinUid').value = st ? (st.checkin_user_id || '') : '';
   document.getElementById('stationEditCheckinToken').value = '';
   document.getElementById('stationEditLoginUser').value = st ? (st.login_username || '') : '';
@@ -15067,10 +15067,15 @@ async function checkinStation(id){
   if(btn){ btn.disabled = true; btn.textContent = '签到中…'; }
   try {
     const r = await postJSON('/stations/checkin', { id: id });
-    // 服务端已按站点返回的 success/message 判定，不再把 HTTP 200 当成功
+    // 服务端只认「带签到证据」的返回，空壳 success 不算成功
     const who = st ? st.name : '站点';
-    if(r.ok){ toast(who + ' 签到：' + (r.message || '成功'), 'ok'); }
-    else { toast(who + ' 签到失败：' + (r.message || '未知原因'), 'bad'); }
+    if(r.ok){
+      toast(who + ' 签到：' + (r.message || '成功'), 'ok');
+    } else {
+      toast(who + ' 签到未生效：' + (r.message || '未知原因'), 'bad');
+      // 原始返回打到控制台，方便对照站点真实接口
+      if(r.resp) console.warn('[station checkin] ' + who + ' resp:', r.resp);
+    }
     await loadStations();
   } catch(e){
     toast('签到失败：' + e.message, 'bad');

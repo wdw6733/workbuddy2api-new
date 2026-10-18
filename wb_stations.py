@@ -122,7 +122,7 @@ def add_station(name, base_url, api_key, enabled=True, priority=0, checkin_url="
         "api_key": str(api_key or "").strip(),
         "enabled": bool(enabled),
         "checkin_url": str(checkin_url or "").strip(),
-        "checkin_method": "GET",
+        "checkin_method": "POST",
         "checkin_token": "",
         "checkin_user_id": "",
         "login_username": str(login_username or "").strip(),
@@ -1086,59 +1086,110 @@ _FAIL_WORDS = ("未登录", "未提供", "无权", "无权限", "失败", "错�
                "token", "unauthorized", "forbidden", "error", "fail")
 
 
-def _checkin_interpret(body, status=200):
-    """解析签到响应，返回 (ok, message)。
+# 真正「签到入账」才会出现的奖励字段
+_CHECKIN_REWARD_KEYS = ("checkin_quota", "quota", "reward", "added_quota",
+                        "credit", "points", "checkin_reward", "checkinQuota")
+# 「签到状态查询」返回里常见的字段：出现这些说明接口只回了状态，没执行签到
+_CHECKIN_STATUS_KEYS = ("checked_in", "checkedIn", "today_checked", "is_checkin",
+                        "is_checkin_today", "checkin_date", "checked", "check_in")
 
-    只认 HTTP 2xx 会把「HTTP 200 + success:false」当成签到成功——面板提示
-    成功、站内却没有签到记录，正是这个原因。这里按 New API / One API 的返回
-    约定判定：
-        {"success": true,  "message": "", "data": {"quota": 500000}}
-        {"success": false, "message": "今天已经签到过了"}
-    「今天已签到」不算失败（状态是好的），只是没有新增收益。
+
+def _checkin_evidence(data):
+    """判定响应属于哪一种：
+
+    - ``confirmed`` 真的签到入账（带奖励字段 / 明确的成功文案）
+    - ``already``   今天已经签过（状态是好的，但没有新增收益）
+    - ``status``    只回了签到状态或空壳 success（**没执行签到**）
+    - ``none``      有文案但既不是成功也不是已签到
+    """
+    if not isinstance(data, dict):
+        return "none"
+    msg = str(data.get("message") or data.get("msg") or "").strip()
+    low = msg.lower()
+    payload = data.get("data")
+    if isinstance(payload, dict):
+        for key in _CHECKIN_REWARD_KEYS:
+            v = payload.get(key)
+            if v not in (None, "", 0, "0"):
+                return "confirmed"
+        for key in _CHECKIN_STATUS_KEYS:
+            if key in payload:
+                return "status"
+    if any(w in msg or w in low for w in _ALREADY_CHECKED):
+        return "already"
+    if any(w in msg for w in ("签到成功", "签到获得", "签到奖励", "已获得")):
+        return "confirmed"
+    if isinstance(payload, (int, float)) and payload:
+        return "confirmed"
+    if msg:
+        return "none"
+    # 既无文案也无 data —— 典型的「状态查询」空壳响应，
+    # 面板以前就是在这里误报「签到成功」的。
+    return "status"
+
+
+def _checkin_reward(data):
+    """从响应里取签到奖励配额（取不到返回空串）。"""
+    payload = data.get("data") if isinstance(data, dict) else None
+    if isinstance(payload, dict):
+        for key in _CHECKIN_REWARD_KEYS:
+            v = payload.get(key)
+            if v not in (None, "", 0, "0"):
+                return str(v)
+    if isinstance(payload, (int, float)) and payload:
+        return str(payload)
+    return ""
+
+
+def _checkin_interpret(body, status=200):
+    """解析签到响应，返回 (ok, message, evidence)。
+
+    只认 HTTP 2xx 会把两种「假成功」当成签到成功，面板提示成功、站内却没有
+    记录，正是之前的问题：
+      1. HTTP 200 + {"success": false, "message": "无权进行此操作..."}
+      2. HTTP 200 + {"success": true}（空壳，其实是签到状态查询的响应）
+
+    所以除了 success，还要看**有没有签到证据**：带奖励字段或明确成功文案才算
+    ``confirmed``；空壳 success 记成 ``status``，由调用方换个方法/地址再试。
     """
     text = (body or "").strip()
     if not text:
-        return (True, "签到接口返回空内容")
+        return (False, "签到接口返回空内容（可能端点不对）", "status")
     if text[:1] == "<":
         return (False, "接口返回的是网页而不是 JSON：鉴权未通过，"
-                       "请填站点「系统访问令牌」或 session cookie")
+                       "请填站点「系统访问令牌」或 session cookie", "none")
     low = text[:600].lower()
     try:
         data = json.loads(text)
     except Exception:
         if any(w in text or w in low for w in _ALREADY_CHECKED):
-            return (True, "今天已签到（无需重复）")
+            return (True, "今天已签到（无需重复）", "already")
         if any(w in text or w in low for w in _FAIL_WORDS):
-            return (False, text[:120])
-        return (True, text[:120])
+            return (False, text[:120], "none")
+        return (True, text[:120], "none")
     if not isinstance(data, dict):
-        return (True, text[:120])
+        return (True, text[:120], "none")
     ok = data.get("success")
     msg = str(data.get("message") or data.get("msg") or "").strip()
-    payload = data.get("data")
-    reward = ""
-    if isinstance(payload, dict):
-        for key in ("quota", "reward", "added_quota", "credit", "points"):
-            if payload.get(key) is not None:
-                reward = str(payload[key])
-                break
-    elif isinstance(payload, (int, float)) and payload:
-        reward = str(payload)
+    evidence = _checkin_evidence(data)
     if ok is False:
-        if any(w in msg or w in msg.lower() for w in _ALREADY_CHECKED):
-            return (True, "今天已签到（无需重复）")
-        return (False, msg or "站点拒绝了签到请求")
+        if evidence == "already":
+            return (True, "今天已签到（无需重复）", "already")
+        return (False, msg or "站点拒绝了签到请求", "none")
     if ok is True:
-        out = msg or "签到成功"
+        if evidence == "already":
+            return (True, "今天已签到（无需重复）", "already")
+        reward = _checkin_reward(data)
+        out = msg or ("签到成功" if evidence == "confirmed" else "站点返回成功")
         if reward:
             out += "（配额 +%s）" % reward
-        return (True, out)
+        return (True, out, evidence)
     # 没有 success 字段：按文案判断
-    if any(w in msg or w in msg.lower() for w in _ALREADY_CHECKED):
-        return (True, "今天已签到（无需重复）")
+    if evidence == "already":
+        return (True, "今天已签到（无需重复）", "already")
     if any(w in msg or w in msg.lower() for w in _FAIL_WORDS):
-        return (False, msg[:120] or "签到失败")
-    return (True, msg[:120] or "签到成功")
+        return (False, msg[:120] or "签到失败", "none")
+    return (True, msg[:120] or "站点返回成功", evidence)
 
 
 def _checkin_url_variants(url):
@@ -1155,74 +1206,118 @@ def _checkin_url_variants(url):
 
 
 def checkin(st_id):
-    """调用站点配置的签到接口（方法/令牌/用户ID 均可配）。
+    """调用站点签到接口，返回 (ok, message, raw_body)。
 
-    返回 (ok, message)：ok 为 True 表示站点确实记录了签到（或今天已签到），
-    不再只看 HTTP 状态码。
+    签到接口在不同 fork 上差异很大：`/checkin` 与 `/check_in`、GET 与 POST，
+    而且**有的 GET 只查今天是否已签（回一个空壳 `{"success":true}`），POST 才
+    真正入账**——这正是「面板报签到成功、站内却没有记录」的根源。
+
+    所以这里按「方法 × 地址 × 鉴权写法」逐个尝试，并且**只认带签到证据的
+    响应**（奖励字段 / 明确的成功文案）。空壳 success 记为未确认，换下一种
+    方法继续试；全部试完仍未确认就如实返回失败，不再谎报成功。
     """
     with _LOCK:
         st = _find(st_id)
         snap = json.loads(json.dumps(st)) if st else None
     if not snap:
-        return (False, "站点不存在")
+        return (False, "站点不存在", "")
     url = str(snap.get("checkin_url") or "").strip()
     if not url:
-        return (False, "未配置签到地址")
-    method = str(snap.get("checkin_method") or "GET").upper()
-    if method not in ("GET", "POST"):
-        method = "GET"
-    data = b"{}" if method == "POST" else None
+        return (False, "未配置签到地址", "")
+    configured = str(snap.get("checkin_method") or "GET").upper()
+    if configured not in ("GET", "POST"):
+        configured = "GET"
+    # 先按配置的方法试；拿不到签到证据再换另一种（GET 常常只是查状态）
+    methods = [configured] + [m for m in ("POST", "GET") if m != configured]
+    urls = _checkin_url_variants(url)
     styles = _auth_styles(snap)
+
     last_error = ""
-    body = ""
+    raw = ""
+    fallback = None          # (msg, body, url, method)：成功但没签到证据
+    attempts = 0
+    max_attempts = 6
 
     def _record(ok, msg, extra=None):
         with _LOCK:
             st = _find(st_id)
             if st:
                 rec = {"at": time.time(), "ok": bool(ok), "message": msg,
-                       "resp": (body or "")[:200]}
+                       "resp": (raw or "")[:400]}
                 if extra:
                     rec.update(extra)
                 st["last_checkin"] = rec
                 save()
 
-    for sidx, style in enumerate(styles):
-        headers = _user_api_headers(snap, style)
-        if method == "POST":
-            headers["Content-Type"] = "application/json"
-        for idx, try_url in enumerate(_checkin_url_variants(url)):
-            try:
-                req = urllib.request.Request(try_url, data=data, headers=headers,
-                                             method=method)
-                with urllib.request.urlopen(req, timeout=BALANCE_TIMEOUT) as resp:
-                    body = resp.read(256 * 1024).decode("utf-8", "replace")
-                    status = getattr(resp, "status", 200)
-                ok, msg = _checkin_interpret(body, status)
-                # 鉴权写法不对（New API 老版本不剥 Bearer）：换下一种写法重试
-                if not ok and _auth_failed(status, body) and sidx + 1 < len(styles):
-                    last_error = msg
+    for method in methods:
+        method_done = False
+        for try_url in urls:
+            if method_done:
+                break
+            for style in styles:
+                if attempts >= max_attempts:
                     break
-                _record(ok, msg, {"url": try_url, "auth": style})
-                _logmsg("stations   : 签到 %s -> %s (%s)"
-                        % (snap.get("name"), "ok" if ok else "fail", msg))
-                return (ok, msg)
-            except urllib.error.HTTPError as exc:
-                last_error = "HTTP %d" % exc.code
-                if exc.code in (401, 403):
-                    last_error = ("HTTP %d：鉴权未通过，请在站点里填「系统访问令牌」"
-                                  "或 session cookie" % exc.code)
-                    break  # 换鉴权写法
-                # 404/405 说明地址写法不对，换备选地址再试一次
-                if exc.code in (404, 405) and idx == 0:
-                    continue
-                break
-            except Exception as exc:
-                last_error = str(exc)[:120]
-                break
+                attempts += 1
+                headers = _user_api_headers(snap, style)
+                payload = None
+                if method == "POST":
+                    headers["Content-Type"] = "application/json"
+                    payload = b"{}"
+                try:
+                    req = urllib.request.Request(try_url, data=payload,
+                                                 headers=headers, method=method)
+                    with urllib.request.urlopen(req, timeout=BALANCE_TIMEOUT) as resp:
+                        raw = resp.read(256 * 1024).decode("utf-8", "replace")
+                        status = getattr(resp, "status", 200)
+                except urllib.error.HTTPError as exc:
+                    if exc.code in (401, 403):
+                        last_error = ("HTTP %d：鉴权未通过，请在站点里填「系统访问令牌」"
+                                      "或 session cookie" % exc.code)
+                        continue          # 换鉴权写法
+                    if exc.code in (404, 405):
+                        last_error = "HTTP %d（地址或方法不对）" % exc.code
+                        break             # 换地址 / 换方法
+                    last_error = "HTTP %d" % exc.code
+                    break
+                except Exception as exc:
+                    last_error = str(exc)[:120]
+                    break
+
+                ok, msg, evidence = _checkin_interpret(raw, status)
+                if ok and evidence in ("confirmed", "already"):
+                    _record(True, msg, {"url": try_url, "method": method,
+                                        "auth": style})
+                    _logmsg("stations   : 签到 %s -> ok (%s) %s %s resp=%s"
+                            % (snap.get("name"), msg, method, try_url, raw[:400]))
+                    return (True, msg, raw)
+                if ok:
+                    # 成功但没证据：空壳 success / 只回了签到状态。
+                    # 地址是通的（能返回合法 JSON），问题在方法，换方法即可，
+                    # 不必再试同一方法的另一个地址写法。
+                    if fallback is None:
+                        fallback = (msg, raw, try_url, method)
+                    _logmsg("stations   : 签到 %s -> 无签到证据（%s %s），换方法重试 resp=%s"
+                            % (snap.get("name"), method, try_url, raw[:200]))
+                    method_done = True
+                    break
+                last_error = msg
+                if _auth_failed(status, raw):
+                    continue              # 换鉴权写法
+                break                     # 业务失败，换地址 / 方法
+
+    if fallback:
+        _msg, body, u, m = fallback
+        note = ("站点返回成功但没有签到结果（%s %s）。该地址很可能只查询签到"
+                "状态，真正的签到接口在别处——请在站点上确认是否已签到。"
+                "原始返回：%s" % (m, u, body[:160]))
+        _record(False, note, {"url": u, "method": m, "unverified": True})
+        _logmsg("stations   : 签到 %s -> unverified resp=%s"
+                % (snap.get("name"), body[:300]))
+        return (False, note, body)
 
     _record(False, last_error or "签到失败")
-    return (False, last_error or "签到失败")
+    _logmsg("stations   : 签到 %s -> fail (%s)" % (snap.get("name"), last_error))
+    return (False, last_error or "签到失败", raw)
 
 
 def _daily_checkin_loop():
