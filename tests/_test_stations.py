@@ -28,6 +28,10 @@ class FakeResponse(object):
     def read(self, limit=None):
         return self.payload[:limit] if limit else self.payload
 
+    @property
+    def headers(self):
+        return {"Content-Encoding": ""}
+
     def __enter__(self):
         return self
 
@@ -685,6 +689,97 @@ class ModelCapabilityTests(unittest.TestCase):
         # @站点 形式不进清单
         self.assertEqual(len(wb_stations.models_entries()), 1)
         self.assertTrue(wb_stations.resolve("gpt-5.2@站A"))
+
+
+# ---- gzip 压缩响应 + relogin 跳过 HTTP ----------------------------------
+
+class GzipResponse(object):
+    """模拟一个 gzip 压缩的 HTTP 响应。"""
+    def __init__(self, payload_dict):
+        import gzip as _g
+        raw = json.dumps(payload_dict, ensure_ascii=False).encode("utf-8")
+        self.payload = _g.compress(raw)
+        self.status = 200
+
+    def read(self, limit=None):
+        return self.payload[:limit] if limit else self.payload
+
+    @property
+    def headers(self):
+        return {"Content-Encoding": "gzip"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class GzipBodyTests(unittest.TestCase):
+    """站点回 gzip 压缩体时，_read_body 要能自动解压。"""
+
+    def setUp(self):
+        reset()
+
+    def test_gzip_body_is_decompressed(self):
+        """签到接口回 gzip 压缩的 JSON，_read_body 必须自动解压。"""
+        resp = GzipResponse({"success": True, "data": {"checked_in_today": True}})
+        body = wb_stations._read_body(resp, 256 * 1024)
+        data = json.loads(body)
+        self.assertTrue(data["data"]["checked_in_today"])
+
+    def test_plain_body_passes_through(self):
+        """非 gzip 响应照常 decode。"""
+        resp = FakeResponse({"success": True})
+        body = wb_stations._read_body(resp, 256 * 1024)
+        self.assertIn("success", body)
+
+    def test_checkin_reads_gzip_response(self):
+        """端到端：签到接口回 gzip 压缩的「已签到」，必须认出来。"""
+        sid = add(name="gzip站", base="https://gzip.example.com/v1")
+        wb_stations.update_station(sid, checkin_token="tok-abc")
+        # mock urlopen：GET 查状态时回 gzip 压缩的「已签到」
+        gz_resp = GzipResponse({
+            "success": True,
+            "data": {"stats": {"checked_in_today": True, "checkin_count": 7}},
+        })
+        with mock.patch("urllib.request.urlopen", return_value=gz_resp):
+            ok, msg, raw = wb_stations.checkin(sid)
+        self.assertTrue(ok, "gzip 压缩的签到状态响应必须能被解析")
+        self.assertIn("已签到", msg)
+
+
+class ReloginSkipTests(unittest.TestCase):
+    """caps.mode=relogin 的站点应直接跳 HTTP 签到，走重登。"""
+
+    def setUp(self):
+        reset()
+
+    def test_relogin_mode_skips_http_attempts(self):
+        """mode=relogin 且有 OAuth 凭据时，不该对 /api/user/checkin 发任何 HTTP 请求。"""
+        sid = add(name="oauth站", base="https://oauth.example.com/v1")
+        wb_stations.update_station(sid, oauth_provider="linuxdo",
+                                    idp_cookie="_forum_session=abc123")
+        # 标记为 relogin 模式（caps 是探测结果，直接写进内存态）
+        wb_stations._find(sid)["caps"] = {
+            "mode": "relogin", "at": time.time(), "reason": "oauth provider",
+        }
+        # mock _relogin_reward 返回成功；同时 mock _read_quota 避免发 HTTP
+        with mock.patch.object(wb_stations, "_relogin_reward",
+                               return_value=(True, "重登成功（配额 +500000）", "")):
+            with mock.patch.object(wb_stations, "_read_quota",
+                                   return_value=1000000):
+                with mock.patch("urllib.request.urlopen") as mock_open:
+                    ok, msg, raw = wb_stations.checkin(sid)
+        self.assertTrue(ok)
+        self.assertIn("重登", msg)
+        # 不该有任何 HTTP 请求发往 /api/user/checkin
+        if mock_open.called:
+            for call in mock_open.call_args_list:
+                url_arg = str(call[0][0]) if call[0] else ""
+                self.assertNotIn("/api/user/checkin", url_arg,
+                                 "relogin 模式不应发签到 HTTP 请求")
+
 
 
 if __name__ == "__main__":

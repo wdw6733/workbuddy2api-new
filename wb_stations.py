@@ -13,6 +13,8 @@
 import json
 import os
 import re
+import gzip
+import io
 import itertools
 import threading
 import time
@@ -35,6 +37,24 @@ _BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 PROBE_TIMEOUT = 10
 # 对话转发连接/读超时（秒）。流式回答可能持续几分钟，读超时给大值。
 CHAT_TIMEOUT = 600
+
+
+def _read_body(resp, max_bytes=256 * 1024):
+    """读取 HTTP 响应体，自动处理 gzip 压缩。
+
+    公益站普遍套 Cloudflare/Nginx，对带浏览器 UA 的请求会回 gzip 压缩体。
+    urllib 不自动解压，直接 decode 会变乱码，导致签到/余额响应无法解析。
+    """
+    data = resp.read(max_bytes)
+    if getattr(resp, "headers", None):
+        enc = (resp.headers.get("Content-Encoding") or "").lower()
+        if enc == "gzip":
+            try:
+                data = gzip.decompress(data)
+            except Exception:
+                pass  # 不是真 gzip，原样返回
+    return data.decode("utf-8", "replace")
+
 
 _LOCK = threading.Lock()
 _STATIONS = []          # 内存态站点清单（含 api_key 明文）
@@ -271,7 +291,8 @@ def _chat_url(st):
 
 
 def _auth_headers(st):
-    h = {"Content-Type": "application/json", "User-Agent": _BROWSER_UA}
+    h = {"Content-Type": "application/json", "User-Agent": _BROWSER_UA,
+         "Accept-Encoding": "identity"}
     key = st.get("api_key") or ""
     if key:
         h["Authorization"] = "Bearer " + key
@@ -402,7 +423,7 @@ def _probe_once(st):
         req = urllib.request.Request(
             _models_url(st), headers=_auth_headers(st), method="GET")
         with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT) as resp:
-            body = resp.read(4 * 1024 * 1024).decode("utf-8", "replace")
+            body = _read_body(resp, 4*1024*1024)
             latency = int((time.time() - t0) * 1000)
             try:
                 data = json.loads(body)
@@ -863,10 +884,11 @@ def _fetch_status_units(st):
     try:
         req = urllib.request.Request(
             _root_url(st) + "/api/status",
-            headers={"Accept": "application/json", "User-Agent": _BROWSER_UA},
+            headers={"Accept": "application/json", "User-Agent": _BROWSER_UA,
+                     "Accept-Encoding": "identity"},
             method="GET")
         with urllib.request.urlopen(req, timeout=BALANCE_TIMEOUT) as resp:
-            data = json.loads(resp.read(256 * 1024).decode("utf-8", "replace"))
+            data = json.loads(_read_body(resp, 256*1024))
     except Exception:
         return info
     d = data.get("data") if isinstance(data, dict) else None
@@ -948,10 +970,10 @@ def _get_json(url, headers, timeout=None):
         req = urllib.request.Request(url, headers=headers, method="GET")
         with urllib.request.urlopen(req, timeout=timeout or BALANCE_TIMEOUT) as resp:
             return (getattr(resp, "status", 200),
-                    resp.read(512 * 1024).decode("utf-8", "replace"))
+                    _read_body(resp, 512*1024))
     except urllib.error.HTTPError as exc:
         try:
-            body = exc.read(512 * 1024).decode("utf-8", "replace")
+            body = _read_body(exc, 512*1024)
         except Exception:
             body = ""
         return (exc.code, body)
@@ -963,7 +985,8 @@ def _status_data(st):
     """GET /api/status 的 data 字段（拿不到返回空 dict）。"""
     _code, body = _get_json(_root_url(st) + "/api/status",
                             {"Accept": "application/json",
-                             "User-Agent": _BROWSER_UA})
+                             "User-Agent": _BROWSER_UA,
+                             "Accept-Encoding": "identity"})
     try:
         data = json.loads(body)
     except Exception:
@@ -1096,7 +1119,7 @@ def fetch_balance(st_id):
                                          method="GET")
             try:
                 with urllib.request.urlopen(req, timeout=BALANCE_TIMEOUT) as resp:
-                    body = resp.read(512 * 1024).decode("utf-8", "replace")
+                    body = _read_body(resp, 512*1024)
                     status = getattr(resp, "status", 200)
             except urllib.error.HTTPError as exc:
                 if exc.code in (401, 403) and idx + 1 < len(styles):
@@ -1222,7 +1245,8 @@ def _user_api_headers(st, style="auto"):
       3. API Key —— 少数用 sk- 鉴权的站
     style: "auto"/"raw"/"bearer"/"cookie" 控制 Authorization 的写法。
     """
-    headers = {"Accept": "application/json", "User-Agent": _BROWSER_UA}
+    headers = {"Accept": "application/json", "User-Agent": _BROWSER_UA,
+               "Accept-Encoding": "identity"}
     if style == "auto":
         styles = _auth_styles(st)
         style = styles[0] if styles else "none"
@@ -1505,7 +1529,7 @@ def _checkin_with_token(snap, token, urls, styles):
                     _with_query(try_url, turnstile=token), data=b"{}",
                     headers=headers, method="POST")
                 with urllib.request.urlopen(req, timeout=BALANCE_TIMEOUT) as resp:
-                    body = resp.read(256 * 1024).decode("utf-8", "replace")
+                    body = _read_body(resp, 256*1024)
                     status = getattr(resp, "status", 200)
             except urllib.error.HTTPError as exc:
                 if exc.code in (401, 403):
@@ -1651,7 +1675,7 @@ def _checkin_status_probe(snap, urls, styles):
                 req = urllib.request.Request(
                     try_url, headers=_user_api_headers(snap, style), method="GET")
                 with urllib.request.urlopen(req, timeout=BALANCE_TIMEOUT) as resp:
-                    raw = resp.read(256 * 1024).decode("utf-8", "replace")
+                    raw = _read_body(resp, 256*1024)
             except urllib.error.HTTPError as exc:
                 if exc.code in (401, 403):
                     continue          # 换鉴权写法
@@ -1779,6 +1803,13 @@ def checkin(st_id, turnstile=None):
             and time.time() - float(caps.get("at") or 0) < 7 * 86400
             and not _can_relogin(snap)):
         return (False, caps.get("reason") or "该站点无法自动签到", "")
+    # 已知是「退出重登」站（没有签到端点，靠重新登录刷额度）：
+    # 直接跳到重登，不走 HTTP 签到 —— 那只会留一堆无意义的失败记录。
+    if caps.get("mode") == "relogin" and _can_relogin(snap):
+        quota_before = _read_quota(snap)
+        relogin = _relogin_reward(snap, st_id, quota_before)
+        if relogin:
+            return relogin
     configured = str(snap.get("checkin_method") or "POST").upper()
     if configured not in ("GET", "POST"):
         configured = "POST"
@@ -1858,7 +1889,7 @@ def checkin(st_id, turnstile=None):
                     req = urllib.request.Request(try_url, data=payload,
                                                  headers=headers, method=method)
                     with urllib.request.urlopen(req, timeout=BALANCE_TIMEOUT) as resp:
-                        raw = resp.read(256 * 1024).decode("utf-8", "replace")
+                        raw = _read_body(resp, 256*1024)
                         status = getattr(resp, "status", 200)
                 except urllib.error.HTTPError as exc:
                     if exc.code in (401, 403):
@@ -2035,7 +2066,8 @@ def login_station(st_id):
     root = _root_url(snap)
     cj = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
-    base_headers = {"Accept": "application/json", "User-Agent": _BROWSER_UA}
+    base_headers = {"Accept": "application/json", "User-Agent": _BROWSER_UA,
+                    "Accept-Encoding": "identity"}
     try:
         # 1. 登录
         body = json.dumps({"username": username, "password": password},
@@ -2045,7 +2077,7 @@ def login_station(st_id):
             headers=dict(base_headers, **{"Content-Type": "application/json"}),
             method="POST")
         with opener.open(req, timeout=LOGIN_TIMEOUT) as resp:
-            data = json.loads(resp.read(256 * 1024).decode("utf-8", "replace"))
+            data = json.loads(_read_body(resp, 256*1024))
         if not (isinstance(data, dict) and data.get("success")):
             msg = str((data or {}).get("message") or "未知错误")[:120]
             return (False, "登录失败: " + msg)
