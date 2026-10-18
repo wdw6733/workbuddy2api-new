@@ -281,6 +281,30 @@ class CheckinRequestTests(unittest.TestCase):
         self.assertEqual(rec["message"], "服务异常")
 
 
+# ---- 站点 id ---------------------------------------------------------
+
+class StationIdTests(unittest.TestCase):
+    """id 只用毫秒时间戳会在同一毫秒内撞车（Linux 上批量添加必现）。"""
+
+    def setUp(self):
+        reset()
+
+    def test_ids_are_unique_within_one_millisecond(self):
+        ids = [wb_stations._new_id() for _ in range(500)]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_two_stations_added_back_to_back_get_distinct_ids(self):
+        a = wb_stations.add_station("A", "https://a.example.com/v1", "k1")
+        b = wb_stations.add_station("B", "https://b.example.com/v1", "k2")
+        self.assertNotEqual(a["id"], b["id"])
+        self.assertEqual(len(wb_stations.view()), 2)
+        # 各自勾的模型必须落在各自的站点上，不能互相覆盖
+        wb_stations.set_selected_models(a["id"], ["m-a"])
+        wb_stations.set_selected_models(b["id"], ["m-b"])
+        self.assertEqual(wb_stations.get_station(a["id"])["models_selected"], ["m-a"])
+        self.assertEqual(wb_stations.get_station(b["id"])["models_selected"], ["m-b"])
+
+
 # ---- 模型能力字段 -----------------------------------------------------
 
 class ModelCapabilityTests(unittest.TestCase):

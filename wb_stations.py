@@ -13,6 +13,7 @@
 import json
 import os
 import re
+import itertools
 import threading
 import time
 import urllib.error
@@ -100,8 +101,18 @@ def _norm_base_url(url):
     return url
 
 
+# 站点 id 的自增序号：只用毫秒时间戳会在同一毫秒内连加两个站点时撞 id
+# （Linux 上批量添加/测试里非常容易发生），撞了就会互相覆盖。
+_ID_SEQ = itertools.count(1)
+
+
 def _new_id():
-    return "st%08x" % (int(time.time() * 1000) & 0xFFFFFFFF)
+    """时间戳 + 进程内自增序号，并保证与现有站点不重复。"""
+    stamp = int(time.time() * 1000) & 0xFFFFFFFF
+    while True:
+        cand = "st%08x%04x" % (stamp, next(_ID_SEQ) & 0xFFFF)
+        if not any(st.get("id") == cand for st in _STATIONS):
+            return cand
 
 
 def _station_default_status():
