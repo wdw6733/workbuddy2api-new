@@ -16079,6 +16079,92 @@ def _release_key_slot(key_entry):
         else:
             _key_active_concurrency.pop(k_id, None)
 
+_TURNSTILE_PAGE = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>人机验证 · WorkBuddy 网关</title>
+<style>
+  :root{color-scheme:light dark}
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+       font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+       background:#f6f7f9;color:#1f2328}
+  .card{background:#fff;border:1px solid #e3e6ea;border-radius:14px;padding:26px 28px;
+        box-shadow:0 10px 30px -12px rgba(0,0,0,.18);max-width:420px;width:calc(100% - 40px)}
+  h1{margin:0 0 6px;font-size:16px}
+  .sub{color:#6b7280;font-size:12px;margin-bottom:16px}
+  #ts{min-height:66px;display:flex;justify-content:center}
+  #msg{margin-top:14px;font-size:13px;min-height:20px;word-break:break-all}
+  .ok{color:#0f7b45}.bad{color:#b42318}.dim{color:#6b7280}
+</style></head>
+<body><div class="card">
+  <h1>人机验证</h1>
+  <div class="sub" id="sub">正在准备…</div>
+  <div id="ts"></div>
+  <div id="msg" class="dim"></div>
+</div>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" async defer></script>
+<script>
+(function(){
+  var q = new URLSearchParams(location.search);
+  var st = q.get('st') || '';
+  var token = '';
+  try { token = decodeURIComponent((location.hash || '').replace(/^#t=/, '')); } catch(e) {}
+  var msgEl = document.getElementById('msg');
+  var subEl = document.getElementById('sub');
+  function say(t, cls){ msgEl.className = cls || 'dim'; msgEl.textContent = t; }
+
+  if(!st){ say('缺少站点参数，请从面板重新打开。', 'bad'); return; }
+  if(!token){ say('面板会话缺失，请回到面板重新点「签到」。', 'bad'); return; }
+
+  fetch('/stations/turnstile-config?id=' + encodeURIComponent(st),
+        {headers: {'X-Panel-Token': token}})
+    .then(function(r){ return r.json(); })
+    .then(function(cfg){
+      if(!cfg || !cfg.ok){ say('获取站点信息失败：' + ((cfg && cfg.error) || '未知'), 'bad'); return; }
+      subEl.textContent = cfg.name || st;
+      if(!cfg.sitekey){
+        say('该站点没有开启 Turnstile，回面板直接点「签到」即可。', 'dim');
+        return;
+      }
+      var tries = 0;
+      (function render(){
+        if(!window.turnstile || !window.turnstile.render){
+          if(++tries > 100){ say('Turnstile 脚本加载失败，请检查网络后刷新。', 'bad'); return; }
+          return setTimeout(render, 150);
+        }
+        window.turnstile.render('#ts', {
+          sitekey: cfg.sitekey,
+          callback: submit,
+          'error-callback': function(){ say('人机验证失败，请刷新页面重试。', 'bad'); },
+          'expired-callback': function(){ say('验证已过期，正在刷新…', 'dim'); setTimeout(function(){ location.reload(); }, 800); }
+        });
+      })();
+    })
+    .catch(function(e){ say('请求失败：' + e.message, 'bad'); });
+
+  function submit(tk){
+    say('已通过人机验证，正在签到…', 'dim');
+    fetch('/stations/turnstile', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Panel-Token': token},
+      body: JSON.stringify({id: st, token: tk})
+    }).then(function(r){ return r.json(); }).then(function(res){
+      if(res && res.ok){
+        say('✅ ' + (res.message || '签到成功'), 'ok');
+        setTimeout(function(){
+          try { if(window.opener && !window.opener.closed) window.opener.location.reload(); } catch(e) {}
+          setTimeout(function(){ window.close(); }, 400);
+        }, 1400);
+      } else {
+        say('❌ ' + ((res && res.message) || '签到未生效'), 'bad');
+      }
+    }).catch(function(e){ say('提交失败：' + e.message, 'bad'); });
+  }
+})();
+</script></body></html>
+"""
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     # 关掉 Nagle（对连接设 TCP_NODELAY）：响应头和响应体是两次独立 write，Nagle
@@ -16720,6 +16806,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_settings()
         if path == "/stations":
             return self._get_stations()
+        if path == "/stations/turnstile-config":
+            return self._get_turnstile_config(query)
+        # 人机验证辅助页：在用户自己的浏览器里解 Cloudflare Turnstile，
+        # 拿到一次性 token 立刻回传给网关完成签到。页面本身不含任何密钥，
+        # 所以放在面板鉴权之外（真正的写接口 /stations/turnstile 仍然要鉴权）。
+        if path == "/turnstile":
+            return self._get_turnstile_page()
         if path == "/updates":
             return self._get_updates()
         if path == "/proxy/slots":
@@ -16745,7 +16838,41 @@ class Handler(BaseHTTPRequestHandler):
         return self._dashboard()
 
     def _get_stations(self):
-        return self._json(200, {"stations": wb_stations.view()})
+        return self._json(200, {"stations": wb_stations.view(),
+                                "solver": wb_stations.solver_status()})
+
+    def _get_turnstile_config(self, query):
+        """给 /turnstile 页面用：这个站点的 Turnstile sitekey。"""
+        if not self._panel_ok():
+            return self._error(401, "panel password required", "invalid_request_error")
+        st_id = (query.get("id") or [""])[0]
+        st = wb_stations.get_station(st_id)
+        if not st:
+            return self._json(200, {"ok": False, "error": "站点不存在"})
+        sitekey = ""
+        try:
+            import wb_solver
+            sitekey = wb_solver.fetch_sitekey(st.get("base_url") or "")
+        except Exception:
+            sitekey = ""
+        return self._json(200, {"ok": True, "name": st.get("name"),
+                                "sitekey": sitekey,
+                                "checkin_url": st.get("checkin_url") or ""})
+
+    def _get_turnstile_page(self):
+        """人机验证辅助页：在用户自己的浏览器里解 Turnstile，回传一次性 token。
+
+        Turnstile 的 token 只能由浏览器 JS 生成、一次性、约 5 分钟过期，所以
+        「抓一次存起来反复用」是不成立的。这个页面把它变成：点一次「签到」→
+        弹窗自动过验证 → 网关立刻拿 token 完成签到 → 弹窗自动关闭。
+        """
+        body = _TURNSTILE_PAGE.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _handle_stations(self, path, payload):
         """面板公益站管理写接口：/stations/save | /stations/delete |
@@ -16840,6 +16967,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": ok, "message": msg,
                                     "resp": (raw or "")[:2000],
                                     "needs_turnstile": bool(st.get("needs_turnstile"))})
+        if path == "/stations/turnstile":
+            # /turnstile 页面在自己浏览器里解出 token 后回传到这里，立刻用掉
+            st_id = str(payload.get("id") or "").strip()
+            token = str(payload.get("token") or "").strip()
+            if not st_id or not token:
+                return self._error(400, "id and token are required",
+                                   "invalid_request_error")
+            ok, msg, raw = wb_stations.checkin_with_token(st_id, token)
+            return self._json(200, {"ok": ok, "message": msg,
+                                    "resp": (raw or "")[:2000]})
         if path == "/stations/login":
             st_id = str(payload.get("id") or "").strip()
             if not st_id:

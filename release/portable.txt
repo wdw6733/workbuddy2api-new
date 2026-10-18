@@ -58,6 +58,7 @@ wb_prompt.py
 wb_proxy.py
 wb_scheduler.py
 wb_settings.py
+wb_solver.py
 wb_stations.py
 wb_tasks.py
 wb_updates.py

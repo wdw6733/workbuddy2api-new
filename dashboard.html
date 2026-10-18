@@ -4318,6 +4318,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       </div>
       <div class="modal-ft">
         <button class="sec" onclick="closeStationCheckin()">关闭</button>
+        <button class="sec" onclick="openTurnstilePopup(_stationCheckinTarget)">用浏览器过验证</button>
         <button class="primary" id="stationCheckinRetry" onclick="retryStationCheckin()">重新签到</button>
       </div>
     </div>
@@ -14858,6 +14859,7 @@ async function loadStations(showToast){
     const data = await getJSON('/stations');
     STATIONS_DATA = data.stations || [];
     renderStations();
+    renderStationSolver(data.solver || null);
   } catch(e){
     if(tbody) tbody.innerHTML = '<tr><td colspan="5" style="color:var(--bad);text-align:center;padding:18px">加载失败：' + esc(e.message) + '</td></tr>';
     if(showToast) toast('公益站加载失败：' + e.message, 'bad');
@@ -15114,13 +15116,25 @@ async function checkinStation(id){
       if(r.resp) console.warn('[station checkin] ' + who + ' resp:', r.resp);
     }
     await loadStations();
-    // 需要人机验证的站点：直接把详情弹窗打开，让用户粘贴一次性 token 重试
-    if(!r.ok && r.needs_turnstile && stationById(id)) openStationCheckin(id);
+    // 需要人机验证：弹一个页面用你自己浏览器过验证，过了立刻回传 token 签到
+    if(!r.ok && r.needs_turnstile){ openTurnstilePopup(id); }
   } catch(e){
     toast('签到失败：' + e.message, 'bad');
   } finally {
     if(btn){ btn.disabled = false; btn.textContent = '签到'; }
   }
+}
+
+// 在自己的浏览器里过 Cloudflare Turnstile：token 一次性，只能现解现用
+function openTurnstilePopup(id){
+  if(!PANEL_TOKEN){ toast('面板会话已失效，请重新登录', 'bad'); return; }
+  const url = '/turnstile?st=' + encodeURIComponent(id) +
+              '#t=' + encodeURIComponent(PANEL_TOKEN);
+  const w = window.open(url, 'wb-turnstile-' + id, 'width=480,height=460,menubar=no,toolbar=no');
+  if(!w){ toast('弹窗被浏览器拦截，请允许本站弹窗后重试', 'warn'); return; }
+  const timer = setInterval(function(){
+    if(!w || w.closed){ clearInterval(timer); loadStations(); }
+  }, 1200);
 }
 
 // 签到详情：把站点原始返回完整摊开，排查「接口不对」时不用翻容器日志

@@ -400,6 +400,65 @@ class BrowserCheckinTests(unittest.TestCase):
         self.assertIn("人机验证", msg)
 
 
+# ---- 打码服务 / 浏览器 token -----------------------------------------
+
+class SolverTests(unittest.TestCase):
+    """wb_solver 只在配置了 key 时生效，未配置必须完全惰性。"""
+
+    def setUp(self):
+        reset()
+        os.environ.pop("WB_CAPSOLVER_KEY", None)
+
+    def tearDown(self):
+        os.environ.pop("WB_CAPSOLVER_KEY", None)
+
+    def test_not_configured_without_key(self):
+        import wb_solver
+        self.assertFalse(wb_solver.configured())
+
+    def test_fetch_sitekey_from_status(self):
+        import wb_solver
+
+        def fake_urlopen(req, timeout=None):
+            return FakeResponse({"data": {"turnstile_check": True,
+                                          "turnstile_site_key": "0x4AAAAAAFIovBqwE9xMkrm_"}})
+
+        with mock.patch.object(wb_solver.urllib.request, "urlopen", fake_urlopen):
+            self.assertEqual(wb_solver.fetch_sitekey("https://api.example.com/v1"),
+                             "0x4AAAAAAFIovBqwE9xMkrm_")
+
+    def test_fetch_sitekey_returns_empty_when_absent(self):
+        import wb_solver
+
+        def fake_urlopen(req, timeout=None):
+            return FakeResponse({"data": {"turnstile_check": False}})
+
+        with mock.patch.object(wb_solver.urllib.request, "urlopen", fake_urlopen):
+            self.assertEqual(wb_solver.fetch_sitekey("https://api.example.com"), "")
+
+    def test_checkin_with_token_posts_the_token(self):
+        """页面回传的 token 必须拼到签到地址上，且结果写进 last_checkin。"""
+        sid = add()
+        wb_stations.update_station(sid, checkin_url="https://api.example.com/api/user/checkin",
+                                   checkin_method="POST")
+        seen = []
+
+        def fake_urlopen(req, timeout=None):
+            seen.append(req.full_url)
+            return FakeResponse({"data": {"checkin_date": "2026-10-18",
+                                          "quota_awarded": 2246295},
+                                 "message": "签到成功", "success": True})
+
+        with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
+            ok, msg, raw = wb_stations.checkin_with_token(sid, "1.0_page_token")
+        self.assertTrue(ok)
+        self.assertEqual(seen[0], "https://api.example.com/api/user/checkin?turnstile=1.0_page_token")
+        rec = wb_stations.get_station(sid)["last_checkin"]
+        self.assertTrue(rec["ok"])
+        self.assertEqual(rec["phase"], "page-token")
+        self.assertIn("2246295", msg)
+
+
 # ---- 模型能力字段 -----------------------------------------------------
 
 class ModelCapabilityTests(unittest.TestCase):

@@ -1325,6 +1325,95 @@ def _mark_turnstile(st_id, flag):
             save()
 
 
+def _solve_turnstile(snap):
+    """用打码服务解一次 Turnstile，返回 token（不可用/失败返回空串）。"""
+    try:
+        import wb_solver
+    except Exception:
+        return ""
+    try:
+        if not wb_solver.configured():
+            return ""
+        sitekey = wb_solver.fetch_sitekey(_root_url(snap))
+        if not sitekey:
+            _logmsg("solver     : %s 的 /api/status 没给 turnstile_site_key"
+                    % snap.get("name"))
+            return ""
+        return wb_solver.solve_turnstile(_root_url(snap) + "/sign-in", sitekey,
+                                        log=_logmsg)
+    except Exception as exc:
+        _logmsg("solver     : 打码失败 %s" % str(exc)[:140])
+        return ""
+
+
+def _checkin_with_token(snap, token, urls, styles):
+    """带着 turnstile token 发一次签到请求，返回 (ok, message, raw)。"""
+    for try_url in urls:
+        for style in styles:
+            headers = _user_api_headers(snap, style)
+            headers["Content-Type"] = "application/json"
+            try:
+                req = urllib.request.Request(
+                    _with_query(try_url, turnstile=token), data=b"{}",
+                    headers=headers, method="POST")
+                with urllib.request.urlopen(req, timeout=BALANCE_TIMEOUT) as resp:
+                    body = resp.read(256 * 1024).decode("utf-8", "replace")
+                    status = getattr(resp, "status", 200)
+            except urllib.error.HTTPError as exc:
+                if exc.code in (401, 403):
+                    continue                      # 换鉴权写法
+                return (False, "HTTP %d" % exc.code, "")
+            except Exception as exc:
+                return (False, str(exc)[:120], "")
+            ok, msg, evidence = _checkin_interpret(body, status, is_action=True)
+            if ok and evidence in ("confirmed", "already"):
+                return (True, msg, body)
+            if evidence == "turnstile":
+                return (False, "打码拿到的 token 未被站点接受", body)
+            return (False, msg, body)
+    return (False, "带 token 的签到请求没有成功", "")
+
+
+def _try_solver(snap, urls, styles):
+    """走「打码服务 → 带 token 签到」。未配置或拿不到 token 时返回 None。"""
+    token = _solve_turnstile(snap)
+    if not token:
+        return None
+    return _checkin_with_token(snap, token, urls, styles)
+
+
+def checkin_with_token(st_id, token):
+    """用外部拿到的一次性 Turnstile token 完成签到（/turnstile 页面回调用）。
+
+    返回 (ok, message, raw)。token 由用户自己的浏览器解出、一次性，
+    所以拿到就必须立刻用掉，不能缓存。
+    """
+    with _LOCK:
+        st = _find(st_id)
+        snap = json.loads(json.dumps(st)) if st else None
+    if not snap:
+        return (False, "站点不存在", "")
+    token = str(token or "").strip()
+    if not token:
+        return (False, "缺少 turnstile token", "")
+    urls = _checkin_url_variants(str(snap.get("checkin_url") or "").strip())
+    if not urls:
+        return (False, "未配置签到地址", "")
+    ok, msg, raw = _checkin_with_token(snap, token, urls, _auth_styles(snap))
+    with _LOCK:
+        st = _find(st_id)
+        if st:
+            st["last_checkin"] = {"at": time.time(), "ok": bool(ok),
+                                  "message": msg, "resp": (raw or "")[:2000],
+                                  "phase": "page-token"}
+            if ok:
+                st["needs_turnstile"] = False
+            save()
+    _logmsg("stations   : 签到 %s -> %s（浏览器 token）%s"
+            % (snap.get("name"), "ok" if ok else "fail", msg))
+    return (ok, msg, raw)
+
+
 def _browser_available():
     """当前镜像里有没有可用的无头浏览器（playwright + chromium）。"""
     try:
@@ -1332,6 +1421,18 @@ def _browser_available():
         return bool(wb_browser.available())
     except Exception:
         return False
+
+
+def solver_status():
+    """面板展示用：打码服务是否已配置。"""
+    configured = False
+    try:
+        import wb_solver
+        configured = bool(wb_solver.configured())
+    except Exception:
+        configured = False
+    return {"provider": "capsolver", "configured": configured,
+            "browser": _browser_available()}
 
 
 def _browser_checkin(snap):
@@ -1460,8 +1561,15 @@ def checkin(st_id, turnstile=None):
         _logmsg("stations   : 签到 %s -> 已签到，跳过动作 (%s)" % (snap.get("name"), msg))
         return (True, msg, raw)
 
-    # ---- 1.5 已知需要人机验证：直接交给无头浏览器，省掉必然失败的 HTTP 动作 ----
+    # ---- 1.5 已知需要人机验证：打码服务 → 浏览器，省掉必然失败的 HTTP 动作 ----
     if snap.get("needs_turnstile"):
+        sres = _try_solver(snap, urls, styles)
+        if sres and sres[0]:
+            _mark_turnstile(st_id, False)
+            _record(True, sres[1], {"phase": "solver"})
+            _logmsg("stations   : 签到 %s -> ok（打码服务）%s"
+                    % (snap.get("name"), sres[1]))
+            return sres
         res = _browser_checkin(snap)
         if res:
             bok, bmsg, braw = res
@@ -1520,10 +1628,21 @@ def checkin(st_id, turnstile=None):
                             % (snap.get("name"), msg, method, try_url, raw[:400]))
                     return (True, msg, raw)
                 if evidence == "turnstile":
-                    # 人机验证是硬性门槛，换方法/地址都没用：交给无头浏览器
+                    # 人机验证是硬性门槛，换方法/地址都没用。
+                    # 顺序：打码服务（快、稳） -> 无头浏览器 -> 提示手动。
                     _mark_turnstile(st_id, True)
                     _logmsg("stations   : 签到 %s -> 需要 Turnstile（%s %s）resp=%s"
                             % (snap.get("name"), method, try_url, raw[:200]))
+                    sres = _try_solver(snap, urls, styles)
+                    if sres and sres[0]:
+                        _mark_turnstile(st_id, False)
+                        _record(True, sres[1], {"phase": "solver"})
+                        _logmsg("stations   : 签到 %s -> ok（打码服务）%s"
+                                % (snap.get("name"), sres[1]))
+                        return sres
+                    if sres:
+                        _logmsg("stations   : 打码 token 未被接受（%s）"
+                                % str(sres[1])[:100])
                     res = _browser_checkin(snap)
                     if res:
                         bok, bmsg, braw = res
