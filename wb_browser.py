@@ -241,3 +241,190 @@ def sitekey_from_page(station, accounts_dir=None, log=None):
                 ctx.close()
             except Exception:
                 pass
+
+
+# ---- 授权登录（linux.do / GitHub）----------------------------------------
+#
+# 有些站点（anyrouter / agentrouter）的「每日奖励」是登录动作本身发的，没有签到
+# 端点。OAuth 这一跳需要 IdP 的登录态，所以把用户粘贴的 IdP cookie 注入浏览器
+# profile，之后每次「退出 → 重新授权」都能无头跑完：
+#
+#   站点 → connect.linux.do/oauth2/authorize → linux.do/session/sso_provider
+#        → 回到站点并下发新会话（奖励在这一步到账）
+
+# 站点上「用 X 登录」按钮的文案
+_OAUTH_TEXTS = {
+    "linuxdo": ("LINUX DO", "LinuxDO", "LINUX.DO", "Linux DO", "linux.do"),
+    "github": ("GitHub", "Github", "github"),
+}
+# IdP 的 cookie 属于哪个域
+_IDP_HOSTS = {"linuxdo": "linux.do", "github": "github.com"}
+# IdP 授权页上的「同意」按钮
+_CONSENT_TEXTS = ("授权", "允许", "同意", "确认授权", "Authorize", "Allow", "Accept")
+
+
+def _parse_cookie_header(raw):
+    """把 "a=1; b=2" 解析成 [(a,1),(b,2)]。"""
+    pairs = []
+    for part in str(raw or "").split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        if name:
+            pairs.append((name, value.strip()))
+    return pairs
+
+
+def _host_of(url):
+    return (urlsplit(url).hostname or "").lower()
+
+
+def _domain_matches(domain, host):
+    domain = (domain or "").lstrip(".").lower()
+    host = (host or "").lower()
+    return bool(domain) and (host == domain or host.endswith("." + domain))
+
+
+def _seed_idp_cookies(context, provider, raw, log=None):
+    """把用户粘贴的 IdP 会话 cookie 写进浏览器上下文。"""
+    host = _IDP_HOSTS.get(provider)
+    pairs = _parse_cookie_header(raw)
+    if not host or not pairs:
+        return 0
+    cookies = [{"name": n, "value": v, "domain": "." + host, "path": "/",
+                "secure": True, "sameSite": "Lax"} for n, v in pairs]
+    try:
+        context.add_cookies(cookies)
+        _log(log, "已注入 %d 个 %s cookie" % (len(pairs), host))
+        return len(pairs)
+    except Exception as exc:
+        _log(log, "注入 %s cookie 失败: %s" % (host, str(exc)[:100]))
+        return 0
+
+
+def _click_text(page, texts, timeout=4000):
+    """按文案点一个可见的按钮/链接，返回命中的文案（没点到返回空串）。"""
+    for text in texts:
+        for sel in ("button:has-text('%s')" % text, "a:has-text('%s')" % text,
+                    "text=%s" % text):
+            try:
+                loc = page.locator(sel).first
+                if loc.count() and loc.is_visible():
+                    loc.click(timeout=timeout)
+                    return text
+            except Exception:
+                continue
+    return ""
+
+
+def _site_quota(page, root):
+    """在站点页面里 fetch /api/user/self：已登录返回 quota，否则 None。"""
+    try:
+        data = page.evaluate("""async (root) => {
+            try {
+                const r = await fetch(root + '/api/user/self', {credentials: 'include'});
+                return await r.json();
+            } catch (e) { return null; }
+        }""", root)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("success") is False:
+        return None
+    d = data.get("data")
+    if not isinstance(d, dict):
+        return None
+    for key in ("quota", "remain_quota"):
+        try:
+            if d.get(key) is not None:
+                return float(d[key])
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def oauth_relogin(station, accounts_dir=None, log=None, timeout=180):
+    """退出后重新走一次授权登录，返回 (ok, message, cookie)。
+
+    成功后把站点的新 session cookie 一并返回，调用方存下来给 HTTP 路径用。
+    """
+    provider = str(station.get("oauth_provider") or "").strip().lower()
+    if provider not in _OAUTH_TEXTS:
+        return (False, "没有配置授权登录方式（linux.do / GitHub）", "")
+    idp_cookie = str(station.get("idp_cookie") or "").strip()
+    if not idp_cookie:
+        return (False, "缺少 %s 的会话 cookie：请在站点编辑里粘贴一次"
+                       % _IDP_HOSTS.get(provider, provider), "")
+    kind = engine()
+    if not kind:
+        return (False, "未安装 cloakbrowser / playwright，无法授权登录", "")
+    root = _root(station)
+    if not root:
+        return (False, "站点地址为空", "")
+
+    with _BROWSER_LOCK:
+        ctx = None
+        try:
+            _log(log, "%s 授权登录（%s）" % (station.get("name"), provider))
+            ctx = _launch(kind, _profile_dir(station, accounts_dir), True)
+            # 1) 先「退出」：清掉站点域的 cookie，但保留 IdP 的 —— 奖励是在
+            #    「新的一次登录」时发的，带着旧会话再点一次不会触发。
+            site_host = _host_of(root)
+            keep = [c for c in ctx.cookies()
+                    if not _domain_matches(c.get("domain"), site_host)]
+            ctx.clear_cookies()
+            if keep:
+                try:
+                    ctx.add_cookies(keep)
+                except Exception:
+                    pass
+            # 2) 注入 IdP 会话
+            if not _seed_idp_cookies(ctx, provider, idp_cookie, log):
+                return (False, "IdP cookie 注入失败（格式应为 name=value; name2=value2）", "")
+
+            page = ctx.pages[0] if getattr(ctx, "pages", None) else ctx.new_page()
+            try:
+                page.goto(root + "/", wait_until="domcontentloaded", timeout=30000)
+            except Exception as exc:
+                return (False, "打开站点失败: %s" % str(exc)[:120], "")
+            time.sleep(3)
+
+            if not _click_text(page, _OAUTH_TEXTS[provider]):
+                return (False, "没找到「%s 登录」按钮" % _IDP_HOSTS.get(provider, provider), "")
+            _log(log, "已点 %s 登录入口，等授权跳转…" % provider)
+
+            deadline = time.time() + timeout
+            consent_done = False
+            while time.time() < deadline:
+                time.sleep(2)
+                if _site_quota(page, root) is not None:
+                    cookies = ["%s=%s" % (c["name"], c["value"])
+                               for c in ctx.cookies()
+                               if _domain_matches(c.get("domain"), site_host)]
+                    _log(log, "授权登录成功（%d 个站点 cookie）" % len(cookies))
+                    return (True, "授权登录成功", "; ".join(cookies))
+                if not consent_done:
+                    for p in list(getattr(ctx, "pages", []) or []):
+                        try:
+                            if _click_text(p, _CONSENT_TEXTS, timeout=2500):
+                                consent_done = True
+                                _log(log, "已点授权确认")
+                                break
+                        except Exception:
+                            continue
+                for p in list(getattr(ctx, "pages", []) or []):
+                    _click_turnstile(p)
+
+            if consent_done:
+                return (False, "授权页点过了但没回到已登录状态（IdP 会话可能过期）", "")
+            return (False, "授权登录超时：多半是 %s 的会话过期了，请重新粘贴 cookie"
+                    % _IDP_HOSTS.get(provider, provider), "")
+        except Exception as exc:
+            return (False, "授权登录失败: %s" % str(exc)[:140], "")
+        finally:
+            if ctx is not None:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass

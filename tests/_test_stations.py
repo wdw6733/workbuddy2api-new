@@ -564,6 +564,73 @@ class AutoDetectTests(unittest.TestCase):
         self.assertIn("500", msg)
 
 
+# ---- 授权登录（linux.do / GitHub）-------------------------------------
+
+class OAuthTests(unittest.TestCase):
+    """anyrouter / agentrouter 只用 linux.do 授权登录，没配过密码。"""
+
+    def setUp(self):
+        reset()
+
+    def test_parse_cookie_header(self):
+        import wb_browser
+        self.assertEqual(
+            wb_browser._parse_cookie_header("_t=abc; _forum_session=def;"),
+            [("_t", "abc"), ("_forum_session", "def")])
+
+    def test_domain_matches(self):
+        import wb_browser
+        self.assertTrue(wb_browser._domain_matches(".linux.do", "connect.linux.do"))
+        self.assertTrue(wb_browser._domain_matches("linux.do", "linux.do"))
+        self.assertFalse(wb_browser._domain_matches(".linux.do", "anyrouter.top"))
+
+    def test_relogin_requires_provider_and_cookie(self):
+        import wb_browser
+        ok, msg, _ = wb_browser.oauth_relogin({"base_url": "https://a.example.com"})
+        self.assertFalse(ok)
+        self.assertIn("授权登录", msg)
+
+        ok, msg, _ = wb_browser.oauth_relogin({"base_url": "https://a.example.com",
+                                              "oauth_provider": "linuxdo"})
+        self.assertFalse(ok)
+        self.assertIn("cookie", msg)
+
+    def test_can_relogin_with_oauth(self):
+        sid = add()
+        st = wb_stations.get_station(sid)
+        self.assertFalse(wb_stations._can_relogin(st))
+        wb_stations.update_station(sid, oauth_provider="linuxdo", idp_cookie="_t=x")
+        st = wb_stations.get_station(sid)
+        self.assertTrue(wb_stations._can_relogin(st))
+        self.assertEqual(st["oauth_provider"], "linuxdo")
+
+    def test_detect_marks_oauth_site_as_relogin(self):
+        sid = add()
+        wb_stations.update_station(sid, oauth_provider="linuxdo", idp_cookie="_t=x")
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url
+            if "/api/status" in url:
+                return FakeResponse({"data": {}})
+            if "/api/user/self" in url:
+                return FakeResponse({"data": {"quota": 100}})
+            if "/api/user/checkin" in url:
+                raise wb_stations.urllib.error.HTTPError(url, 404, "nf", {}, None)
+            return FakeResponse({"data": {}})
+
+        with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
+            caps = wb_stations.detect_caps(sid)
+        self.assertEqual(caps["mode"], "relogin")
+        self.assertIn("授权登录", caps["reason"])
+
+    def test_idp_cookie_is_never_returned_to_the_panel(self):
+        sid = add()
+        wb_stations.update_station(sid, oauth_provider="linuxdo", idp_cookie="_t=secret")
+        row = [s for s in wb_stations.view() if s["id"] == sid][0]
+        self.assertTrue(row["has_idp_cookie"])
+        self.assertNotIn("idp_cookie", row)
+
+
 # ---- 模型能力字段 -----------------------------------------------------
 
 class ModelCapabilityTests(unittest.TestCase):

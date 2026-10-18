@@ -16890,6 +16890,8 @@ class Handler(BaseHTTPRequestHandler):
             login_username = payload.get("login_username")
             login_password = payload.get("login_password")
             session_cookie = payload.get("session_cookie")
+            oauth_provider = payload.get("oauth_provider")
+            idp_cookie = payload.get("idp_cookie")
             enabled = payload.get("enabled")
             if enabled is not None:
                 enabled = bool(enabled)
@@ -16907,7 +16909,9 @@ class Handler(BaseHTTPRequestHandler):
                     checkin_user_id=checkin_user_id,
                     login_username=login_username,
                     login_password=login_password,
-                    session_cookie=session_cookie)
+                    session_cookie=session_cookie,
+                    oauth_provider=oauth_provider,
+                    idp_cookie=idp_cookie)
                 if not st:
                     return self._error(404, "station not found", "invalid_request_error")
             else:
@@ -16920,7 +16924,9 @@ class Handler(BaseHTTPRequestHandler):
                         checkin_user_id=checkin_user_id,
                         login_username=login_username,
                         login_password=login_password,
-                        session_cookie=session_cookie) or st
+                        session_cookie=session_cookie,
+                        oauth_provider=oauth_provider,
+                        idp_cookie=idp_cookie) or st
             wb_stations.probe_one_async(st["id"])
             wb_stations.fetch_balance_all_async()
             return self._json(200, {"ok": True, "station": st})

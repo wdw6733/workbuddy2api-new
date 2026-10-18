@@ -140,6 +140,10 @@ def add_station(name, base_url, api_key, enabled=True, priority=0, checkin_url="
         "login_username": str(login_username or "").strip(),
         "login_password": str(login_password or "").strip(),
         "session_cookie": "",
+        # 授权登录：linuxdo / github。idp_cookie 是 IdP 自己的会话 cookie，
+        # 粘贴一次（有效数周），之后每次「退出重登」都能无头跑完。
+        "oauth_provider": "",
+        "idp_cookie": "",
         "priority": priority,
         "models_selected": [],
         "models_all": [],
@@ -157,7 +161,8 @@ def add_station(name, base_url, api_key, enabled=True, priority=0, checkin_url="
 def update_station(st_id, name=None, base_url=None, api_key=None, enabled=None,
                    checkin_url=None, priority=None, checkin_method=None,
                    checkin_token=None, checkin_user_id=None,
-                   login_username=None, login_password=None, session_cookie=None):
+                   login_username=None, login_password=None, session_cookie=None,
+                   oauth_provider=None, idp_cookie=None):
     """更新站点；api_key 传 None 或空串表示保留原值。返回更新后的站点或 None。"""
     with _LOCK:
         st = _find(st_id)
@@ -194,6 +199,11 @@ def update_station(st_id, name=None, base_url=None, api_key=None, enabled=None,
             st["login_password"] = str(login_password).strip()
         if session_cookie is not None and str(session_cookie).strip():
             st["session_cookie"] = str(session_cookie).strip()
+        if oauth_provider is not None:
+            p = str(oauth_provider).strip().lower()
+            st["oauth_provider"] = p if p in ("linuxdo", "github") else ""
+        if idp_cookie is not None:
+            st["idp_cookie"] = str(idp_cookie).strip()
         # 地址或密钥变了，旧测活结果不再可信
         st["status"] = _station_default_status()
         st["models_all"] = []
@@ -783,6 +793,10 @@ def view():
             item.pop("login_password", None)
             item["session_cookie_set"] = bool(str(st.get("session_cookie") or "").strip())
             item.pop("session_cookie", None)
+            # 授权登录：只回传 provider 与「是否粘过 IdP cookie」，不回传 cookie 本身
+            item["oauth_provider"] = st.get("oauth_provider") or ""
+            item["has_idp_cookie"] = bool(str(st.get("idp_cookie") or "").strip())
+            item.pop("idp_cookie", None)
             item["last_checkin"] = st.get("last_checkin")
             # 该站点签到需要 Cloudflare Turnstile：面板要提示「只能手动签到」
             item["needs_turnstile"] = bool(st.get("needs_turnstile"))
@@ -1041,12 +1055,14 @@ def detect_caps(st_id, persist=True):
             caps["count"] = stats[1]
         caps["mode"] = "click"
         caps["reason"] = "站点提供签到端点"
-    elif snap.get("login_username") and snap.get("login_password"):
+    elif _can_relogin(snap):
         caps["mode"] = "relogin"
-        caps["reason"] = "没有签到端点，按「退出重登奖励」处理"
+        caps["reason"] = ("没有签到端点，按「退出重登奖励」处理（%s）"
+                          % ("授权登录 " + str(snap.get("oauth_provider"))
+                             if snap.get("oauth_provider") else "账号密码登录"))
     else:
         caps["mode"] = "none"
-        caps["reason"] = ("没有签到端点，也没有登录账号密码，无法自动签到"
+        caps["reason"] = ("没有签到端点，也没有可用的登录方式（授权登录或账号密码）"
                           if code else "站点不可达或 /api/user/checkin 无响应")
 
     if persist:
@@ -1653,6 +1669,14 @@ def _checkin_status_probe(snap, urls, styles):
     return (None, None, "", "")
 
 
+def _can_relogin(st):
+    """有没有可用于「退出重登」的登录方式。"""
+    if str(st.get("oauth_provider") or "").strip() in ("linuxdo", "github"):
+        return bool(str(st.get("idp_cookie") or "").strip())
+    return bool(str(st.get("login_username") or "").strip()
+                and str(st.get("login_password") or "").strip())
+
+
 def _fmt_quota_delta(st, delta):
     """把配额差值换算成「N 配额 ≈ ¥x」。"""
     units = _fetch_status_units(st)
@@ -1668,11 +1692,39 @@ def _fmt_quota_delta(st, delta):
 
 
 def _relogin_reward(snap, st_id, quota_before):
-    """有的站点没有签到端点：退出重登就发奖励。用配额增长自证。"""
-    ok, msg = login_station(st_id)
-    if not ok:
-        _logmsg("stations   : %s 重登失败（%s）" % (snap.get("name"), msg))
+    """没有签到端点的站点：退出重登一次，用配额增长自证。
+
+    两条登录路径：
+      - 配了 oauth_provider（linuxdo / github）：走浏览器授权登录，需要 idp_cookie；
+      - 否则用账号密码走 /api/user/login。
+    """
+    provider = str(snap.get("oauth_provider") or "").strip().lower()
+    cookie = ""
+    if provider:
+        try:
+            import wb_browser
+        except Exception:
+            return None
+        ok, msg, cookie = wb_browser.oauth_relogin(
+            snap, accounts_dir=_accounts_dir(), log=_logmsg)
+        if not ok:
+            _logmsg("stations   : %s 授权登录失败（%s）" % (snap.get("name"), msg))
+            return None
+        # 顺手把站点的新会话存下来，HTTP 路径（余额/签到）也能用
+        if cookie:
+            with _LOCK:
+                st = _find(st_id)
+                if st:
+                    st["session_cookie"] = cookie
+                    save()
+    elif snap.get("login_username") and snap.get("login_password"):
+        ok, msg = login_station(st_id)
+        if not ok:
+            _logmsg("stations   : %s 重登失败（%s）" % (snap.get("name"), msg))
+            return None
+    else:
         return None
+
     quota_after = _read_quota(snap)
     if quota_before is None or quota_after is None or quota_after <= quota_before:
         _logmsg("stations   : %s 重登完成但配额没涨（%s -> %s）"
@@ -1725,7 +1777,7 @@ def checkin(st_id, turnstile=None):
     caps = snap.get("caps") or {}
     if (caps.get("mode") == "none"
             and time.time() - float(caps.get("at") or 0) < 7 * 86400
-            and not (snap.get("login_username") and snap.get("login_password"))):
+            and not _can_relogin(snap)):
         return (False, caps.get("reason") or "该站点无法自动签到", "")
     configured = str(snap.get("checkin_method") or "POST").upper()
     if configured not in ("GET", "POST"):
@@ -1910,7 +1962,7 @@ def checkin(st_id, turnstile=None):
         return (False, note, body)
 
     # ---- 4. 没有签到端点：有的站点是「退出重登即到账」 ----
-    if snap.get("login_username") and snap.get("login_password"):
+    if _can_relogin(snap):
         relogin = _relogin_reward(snap, st_id, quota_before)
         if relogin:
             return relogin
