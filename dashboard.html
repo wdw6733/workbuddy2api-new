@@ -4187,6 +4187,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <div class="toolbar">
         <button class="primary" onclick="openStationEdit()">+ 添加站点</button>
         <button class="sec" onclick="probeStationsAll()">全部测活</button>
+        <button class="sec" onclick="detectStationsAll()">探测签到方式</button>
         <button class="sec" onclick="loadStations(true)">刷新</button>
         <span style="align-self:center;font-size:12px;color:var(--dim)" id="stationsHint">同名模型自动合并；多站共享时按「优先级 + 延迟」选站，失败自动切换。</span>
       </div>
@@ -14846,6 +14847,7 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
    这里只用 getJSON/postJSON/toast/esc。 */
 let STATIONS_DATA = [];
 let STATIONS_LOADING = false;
+let STATION_SOLVER = null;
 let _stationsEditModelsTarget = null;   // 当前正在勾选模型的站点 id
 let _stationsModelsAll = [];            // 该站点已发现模型清单
 let _stationsModelsMeta = {};           // 模型 -> 站点自报的能力字段（上下文/输出）
@@ -14858,9 +14860,10 @@ async function loadStations(showToast){
   try {
     const data = await getJSON('/stations');
     STATIONS_DATA = data.stations || [];
+    STATION_SOLVER = data.solver || null;
     renderStations();
     // 提示行是锦上添花：它出错不该把整个站点列表一起带崩
-    try { renderStationSolver(data.solver || null); } catch(e) { console.warn(e); }
+    try { renderStationSolver(STATION_SOLVER); } catch(e) { console.warn(e); }
   } catch(e){
     if(tbody) tbody.innerHTML = '<tr><td colspan="6" style="color:var(--bad);text-align:center;padding:18px">加载失败：' + esc(e.message) + '</td></tr>';
     if(showToast) toast('公益站加载失败：' + e.message, 'bad');
@@ -14927,8 +14930,15 @@ function renderStations(){
     // 余额已单独成列，说明里去掉服务端拼的那段，避免重复
     let note = (st.note || '').replace(/｜余额 [^｜]*/g, '');
     if(shared > 0){ note += '｜' + shared + ' 个模型多站共享（自动故障转移）'; }
-    // 签到强制人机验证的站点：自动签到必然失败，明确标出来
-    if(st.needs_turnstile){ note += '｜签到需人机验证（请手动签到）'; }
+    // 探测出来的签到方式：让用户一眼看到「这个站会自动怎么签」
+    const caps = st.caps || null;
+    if(caps && caps.mode){
+      const label = caps.mode === 'click' ? '点击签到'
+                  : (caps.mode === 'relogin' ? '重登奖励' : '无法自动');
+      note += '｜自动：' + label + (caps.turnstile ? ' + 人机验证' : '');
+    } else if(st.needs_turnstile){
+      note += '｜人机验证站点';
+    }
     // 最近一次签到结果：只放时间与成败；点开可看完整返回（排查接口用）
     const lc = st.last_checkin || null;
     let lcHtml = '';
@@ -15086,6 +15096,27 @@ async function probeStationsAll(){
     setTimeout(function(){ loadStations(); }, 6000);
   } catch(e){
     toast('测活失败：' + e.message, 'bad');
+  }
+}
+
+async function detectStationsAll(){
+  try {
+    toast('正在探测各站点的签到方式…', 'info');
+    const r = await postJSON('/stations/detect', {});
+    const rows = r.stations || [];
+    let click = 0, relogin = 0, none = 0, ts = 0;
+    rows.forEach(function(x){
+      const c = x.caps || {};
+      if(c.mode === 'click') click++;
+      else if(c.mode === 'relogin') relogin++;
+      else none++;
+      if(c.turnstile) ts++;
+    });
+    toast('探测完成：点击签到 ' + click + ' 个 · 重登奖励 ' + relogin +
+          ' 个 · 无法自动 ' + none + ' 个（其中 ' + ts + ' 个有人机验证）', 'ok');
+    await loadStations();
+  } catch(e){
+    toast('探测失败：' + e.message, 'bad');
   }
 }
 

@@ -16876,7 +16876,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_stations(self, path, payload):
         """面板公益站管理写接口：/stations/save | /stations/delete |
-        /stations/probe | /stations/models | /stations/balance | /stations/checkin。"""
+        /stations/probe | /stations/models | /stations/balance |
+        /stations/checkin | /stations/detect。"""
         if path == "/stations/save":
             st_id = str(payload.get("id") or "").strip()
             name = str(payload.get("name") or "").strip()
@@ -16956,6 +16957,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": ok, "balance": bal})
             wb_stations.fetch_balance_all_async()
             return self._json(200, {"ok": True, "balance_all": True})
+        if path == "/stations/detect":
+            # 探测签到方式：不用用户逐站配 checkin_url / method / sitekey
+            st_id = str(payload.get("id") or "").strip()
+            if st_id:
+                caps = wb_stations.detect_caps(st_id)
+                return self._json(200, {"ok": bool(caps), "caps": caps or {}})
+            out = []
+            for st in wb_stations.view():
+                caps = wb_stations.detect_caps(st["id"])
+                out.append({"id": st["id"], "name": st.get("name"),
+                            "caps": caps or {}})
+            return self._json(200, {"ok": True, "stations": out})
         if path == "/stations/checkin":
             st_id = str(payload.get("id") or "").strip()
             if not st_id:

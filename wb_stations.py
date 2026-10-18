@@ -786,6 +786,8 @@ def view():
             item["last_checkin"] = st.get("last_checkin")
             # 该站点签到需要 Cloudflare Turnstile：面板要提示「只能手动签到」
             item["needs_turnstile"] = bool(st.get("needs_turnstile"))
+            # 自动探测出来的签到方式（click / relogin / none）
+            item["caps"] = st.get("caps")
             out.append(item)
         return out
 
@@ -924,6 +926,136 @@ def _auth_failed(status, body):
         return False
     msg = str(data.get("message") or data.get("msg") or "").lower()
     return any(w in msg for w in _AUTH_WORDS)
+
+
+def _get_json(url, headers, timeout=None):
+    """GET 一个 JSON 端点，返回 (status_code, body_text)。不抛异常。"""
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout or BALANCE_TIMEOUT) as resp:
+            return (getattr(resp, "status", 200),
+                    resp.read(512 * 1024).decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read(512 * 1024).decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        return (exc.code, body)
+    except Exception:
+        return (0, "")
+
+
+def _status_data(st):
+    """GET /api/status 的 data 字段（拿不到返回空 dict）。"""
+    _code, body = _get_json(_root_url(st) + "/api/status",
+                            {"Accept": "application/json",
+                             "User-Agent": _BROWSER_UA})
+    try:
+        data = json.loads(body)
+    except Exception:
+        return {}
+    d = data.get("data") if isinstance(data, dict) else None
+    return d if isinstance(d, dict) else {}
+
+
+def _read_quota(st):
+    """读站点当前剩余配额（quota 整数）。拿不到返回 None。
+
+    用来做「结果自证」：签到前后比对配额，涨了才算真的签上，不依赖各家
+    五花八门的 success/message 措辞。
+    """
+    for style in _auth_styles(st):
+        code, body = _get_json(_balance_url(st), _user_api_headers(st, style))
+        if code in (401, 403):
+            continue
+        try:
+            data = json.loads(body)
+        except Exception:
+            continue
+        d = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(d, dict):
+            continue
+        for key in ("remain_quota", "quota"):
+            try:
+                if d.get(key) is not None:
+                    return float(d[key])
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def detect_caps(st_id, persist=True):
+    """探测站点支持哪种签到 —— 用户不用再填 checkin_url / method / sitekey。
+
+    New API 系的约定足够统一，答案都在站点自己身上：
+      GET /api/status        -> turnstile_check / turnstile_site_key
+      GET /api/user/self     -> 凭据是否有效、当前配额
+      GET /api/user/checkin  -> 端点是否存在、今天签没签、累计次数
+    没有签到端点但配了账号密码的，判定为「重登奖励」型（退出重登即到账）。
+
+    返回 caps dict，字段：
+      mode          click | relogin | none
+      endpoint      实际会 POST 的地址
+      status_code   探测时 /api/user/checkin 的 HTTP 码（404 = 没有这个端点）
+      turnstile     是否强制人机验证
+      sitekey       Turnstile sitekey
+      checked_today 今天是否已签（None = 查不到）
+      count         累计签到次数
+      quota         当前配额
+      reason        判定说明
+    """
+    with _LOCK:
+        st = _find(st_id)
+        snap = json.loads(json.dumps(st)) if st else None
+    if not snap:
+        return None
+    root = _root_url(snap)
+    caps = {"at": time.time(), "mode": "none", "endpoint": "", "status_code": 0,
+            "turnstile": False, "sitekey": "", "checked_today": None,
+            "count": None, "quota": None, "reason": ""}
+
+    data = _status_data(snap)
+    caps["turnstile"] = bool(data.get("turnstile_check"))
+    for key in ("turnstile_site_key", "turnstileSiteKey"):
+        val = str(data.get(key) or "").strip()
+        if val:
+            caps["sitekey"] = val
+            break
+    caps["quota"] = _read_quota(snap)
+
+    endpoint = root + "/api/user/checkin"
+    caps["endpoint"] = endpoint
+    code = 0
+    for style in _auth_styles(snap):
+        code, _body = _get_json(endpoint, _user_api_headers(snap, style))
+        if code in (401, 403):
+            continue
+        break
+    caps["status_code"] = code
+
+    if code and code not in (404, 405):
+        checked, stats, _raw, _url = _checkin_status_probe(
+            snap, [endpoint], _auth_styles(snap))
+        caps["checked_today"] = checked
+        if stats:
+            caps["count"] = stats[1]
+        caps["mode"] = "click"
+        caps["reason"] = "站点提供签到端点"
+    elif snap.get("login_username") and snap.get("login_password"):
+        caps["mode"] = "relogin"
+        caps["reason"] = "没有签到端点，按「退出重登奖励」处理"
+    else:
+        caps["mode"] = "none"
+        caps["reason"] = ("没有签到端点，也没有登录账号密码，无法自动签到"
+                          if code else "站点不可达或 /api/user/checkin 无响应")
+
+    if persist:
+        with _LOCK:
+            st = _find(st_id)
+            if st:
+                st["caps"] = caps
+                save()
+    return caps
 
 
 def fetch_balance(st_id):
@@ -1521,6 +1653,43 @@ def _checkin_status_probe(snap, urls, styles):
     return (None, None, "", "")
 
 
+def _fmt_quota_delta(st, delta):
+    """把配额差值换算成「N 配额 ≈ ¥x」。"""
+    units = _fetch_status_units(st)
+    qpu = units.get("quota_per_unit") or QUOTA_PER_UNIT_DEFAULT
+    rate = units.get("usd_exchange_rate") or EXCHANGE_RATE_DEFAULT
+    currency = "CNY" if units.get("display_in_currency", True) else "USD"
+    try:
+        money = float(delta) / float(qpu) * (rate if currency == "CNY" else 1.0)
+    except Exception:
+        return "配额 +%d" % int(delta)
+    symbol = "¥" if currency == "CNY" else "$"
+    return "配额 +%d ≈ %s%.2f" % (int(delta), symbol, money)
+
+
+def _relogin_reward(snap, st_id, quota_before):
+    """有的站点没有签到端点：退出重登就发奖励。用配额增长自证。"""
+    ok, msg = login_station(st_id)
+    if not ok:
+        _logmsg("stations   : %s 重登失败（%s）" % (snap.get("name"), msg))
+        return None
+    quota_after = _read_quota(snap)
+    if quota_before is None or quota_after is None or quota_after <= quota_before:
+        _logmsg("stations   : %s 重登完成但配额没涨（%s -> %s）"
+                % (snap.get("name"), quota_before, quota_after))
+        return None
+    delta = quota_after - quota_before
+    text = "重登奖励到账（%s）" % _fmt_quota_delta(snap, delta)
+    with _LOCK:
+        st = _find(st_id)
+        if st:
+            st["last_checkin"] = {"at": time.time(), "ok": True, "message": text,
+                                  "resp": "", "phase": "relogin"}
+            save()
+    _logmsg("stations   : 签到 %s -> ok（重登奖励 +%d）" % (snap.get("name"), delta))
+    return (True, text, "")
+
+
 def checkin(st_id, turnstile=None):
     """调用站点签到接口，返回 (ok, message, raw_body)。
 
@@ -1545,9 +1714,19 @@ def checkin(st_id, turnstile=None):
         snap = json.loads(json.dumps(st)) if st else None
     if not snap:
         return (False, "站点不存在", "")
-    url = str(snap.get("checkin_url") or "").strip()
+    # 签到地址不用用户填：New API 系的端点固定是 /api/user/checkin。
+    # 用户只在站点确实不按这个约定时才需要覆盖它。
+    url = str(snap.get("checkin_url") or "").strip() or (
+        _root_url(snap) + "/api/user/checkin")
     if not url:
-        return (False, "未配置签到地址", "")
+        return (False, "站点地址为空", "")
+
+    # 探测过且确认没法自动签的站点，7 天内不再空跑（省得每天留一条失败记录）。
+    caps = snap.get("caps") or {}
+    if (caps.get("mode") == "none"
+            and time.time() - float(caps.get("at") or 0) < 7 * 86400
+            and not (snap.get("login_username") and snap.get("login_password"))):
+        return (False, caps.get("reason") or "该站点无法自动签到", "")
     configured = str(snap.get("checkin_method") or "POST").upper()
     if configured not in ("GET", "POST"):
         configured = "POST"
@@ -1582,6 +1761,9 @@ def checkin(st_id, turnstile=None):
         _mark_turnstile(st_id, False)
         _logmsg("stations   : 签到 %s -> 已签到，跳过动作 (%s)" % (snap.get("name"), msg))
         return (True, msg, raw)
+
+    # ---- 1.2 记下签到前的配额：后面用它自证「到底签上没有」 ----
+    quota_before = _read_quota(snap)
 
     # ---- 1.5 已知需要人机验证：打码服务 → 浏览器，省掉必然失败的 HTTP 动作 ----
     if snap.get("needs_turnstile"):
@@ -1706,16 +1888,32 @@ def checkin(st_id, turnstile=None):
                 % (snap.get("name"), msg))
         return (True, msg, raw)
 
+    # ---- 3.5 余额自证：状态查不到时，配额真的涨了就是签上了 ----
+    # 各家 fork 的 success/message 措辞差异很大，但「配额变多」是硬事实。
+    quota_after = _read_quota(snap)
+    if (quota_before is not None and quota_after is not None
+            and quota_after > quota_before):
+        delta = quota_after - quota_before
+        msg = "签到成功（%s）" % _fmt_quota_delta(snap, delta)
+        _record(True, msg, {"phase": "delta"})
+        _logmsg("stations   : 签到 %s -> ok（配额 +%d）" % (snap.get("name"), delta))
+        return (True, msg, raw)
+
     if fallback:
         _msg, body, u, m = fallback
         note = ("该接口只返回了签到状态，没有执行签到（%s %s），站点显示今天"
-                "尚未签到。请在站点上点一次「签到」并用 F12 → Network 抓出真正"
-                "的请求地址与方法，填到「签到地址 / 签到方法」里。"
-                "原始返回：%s" % (m, u, body[:400]))
+                "尚未签到，配额也没有变化。原始返回：%s"
+                % (m, u, body[:400]))
         _record(False, note, {"url": u, "method": m, "unverified": True})
         _logmsg("stations   : 签到 %s -> unverified resp=%s"
                 % (snap.get("name"), body[:400]))
         return (False, note, body)
+
+    # ---- 4. 没有签到端点：有的站点是「退出重登即到账」 ----
+    if snap.get("login_username") and snap.get("login_password"):
+        relogin = _relogin_reward(snap, st_id, quota_before)
+        if relogin:
+            return relogin
 
     _record(False, last_error or "签到失败")
     _logmsg("stations   : 签到 %s -> fail (%s)" % (snap.get("name"), last_error))
@@ -1735,10 +1933,10 @@ def _daily_checkin_loop():
                 done_dates["date"] = today
                 has_browser = _browser_available()
                 with _LOCK:
+                    # 不再要求「配了 checkin_url」：端点由 /api/user/checkin 自动推导，
+                    # 没有端点的站点会走「退出重登奖励」分支。
                     rows = [(s["id"], s.get("name"), bool(s.get("needs_turnstile")))
-                            for s in _STATIONS
-                            if s.get("enabled")
-                            and str(s.get("checkin_url") or "").strip()]
+                            for s in _STATIONS if s.get("enabled")]
                 # 需要人机验证的站点：镜像里带浏览器才排进来，否则跳过并提示一次
                 targets = [sid for sid, _n, need in rows if has_browser or not need]
                 skipped = [n for _sid, n, need in rows if need and not has_browser]

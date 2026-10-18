@@ -457,6 +457,113 @@ class SolverTests(unittest.TestCase):
         self.assertIn("2246295", msg)
 
 
+# ---- 自动探测：不填机制也能签到 ---------------------------------------
+
+class AutoDetectTests(unittest.TestCase):
+    """站点的签到方式应该由探测决定，而不是让用户逐站填 checkin_url/method。"""
+
+    def setUp(self):
+        reset()
+
+    def _fake(self, status_code=200, checked=False, count=2, quota=1000,
+              turnstile=True):
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url
+            if "/api/status" in url:
+                return FakeResponse({"data": {
+                    "turnstile_check": turnstile,
+                    "turnstile_site_key": "0x4AAAAAAFIovBqwE9xMkrm_"}})
+            if "/api/user/self" in url:
+                return FakeResponse({"data": {"quota": quota}})
+            if "/api/user/checkin" in url:
+                if status_code == 404:
+                    raise wb_stations.urllib.error.HTTPError(
+                        url, 404, "not found", {}, None)
+                return FakeResponse({"data": {"stats": {
+                    "checked_in_today": checked, "checkin_count": count}}})
+            return FakeResponse({"data": {}})
+        return fake_urlopen
+
+    def test_detects_click_mode_with_turnstile(self):
+        sid = add()
+        with mock.patch.object(wb_stations.urllib.request, "urlopen",
+                               self._fake()):
+            caps = wb_stations.detect_caps(sid)
+        self.assertEqual(caps["mode"], "click")
+        self.assertTrue(caps["turnstile"])
+        self.assertEqual(caps["sitekey"], "0x4AAAAAAFIovBqwE9xMkrm_")
+        self.assertFalse(caps["checked_today"])
+        self.assertEqual(caps["count"], 2)
+        self.assertEqual(caps["quota"], 1000)
+        # 结果要落到站点上，面板才能显示
+        self.assertEqual(wb_stations.get_station(sid)["caps"]["mode"], "click")
+
+    def test_no_endpoint_with_credentials_is_relogin(self):
+        sid = add()
+        wb_stations.update_station(sid, login_username="u", login_password="p")
+        with mock.patch.object(wb_stations.urllib.request, "urlopen",
+                               self._fake(status_code=404)):
+            caps = wb_stations.detect_caps(sid)
+        self.assertEqual(caps["mode"], "relogin")
+        self.assertIn("重登", caps["reason"])
+
+    def test_no_endpoint_without_credentials_is_none(self):
+        sid = add()
+        with mock.patch.object(wb_stations.urllib.request, "urlopen",
+                               self._fake(status_code=404)):
+            caps = wb_stations.detect_caps(sid)
+        self.assertEqual(caps["mode"], "none")
+        self.assertIn("账号密码", caps["reason"])
+
+    def test_checkin_derives_the_endpoint_when_not_configured(self):
+        """不填 checkin_url 也要能签：端点固定是 {root}/api/user/checkin。"""
+        sid = add()
+        seen = []
+
+        def fake_urlopen(req, timeout=None):
+            seen.append((req.get_method(), req.full_url))
+            if "/api/status" in req.full_url:
+                return FakeResponse({"data": {}})
+            if "/api/user/self" in req.full_url:
+                return FakeResponse({"data": {"quota": 1000}})
+            if "/api/user/checkin" in req.full_url:
+                if req.get_method() == "POST":
+                    return FakeResponse({"message": "签到成功", "success": True,
+                                         "data": {"quota_awarded": 500}})
+                return FakeResponse({"data": {"stats": {
+                    "checked_in_today": False, "checkin_count": 1}}})
+            return FakeResponse({"data": {}})
+
+        with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
+            ok, msg, raw = wb_stations.checkin(sid)
+        self.assertTrue(ok)
+        posts = [u for m, u in seen if m == "POST"]
+        self.assertEqual(posts[0], "https://api.example.com/api/user/checkin")
+
+    def test_quota_growth_proves_success_even_when_response_is_vague(self):
+        """站点回一句含糊的 success，但配额涨了 —— 就该判成功。"""
+        sid = add()
+        quota = {"v": 1000}
+
+        def fake_urlopen(req, timeout=None):
+            if "/api/status" in req.full_url:
+                return FakeResponse({"data": {}})
+            if "/api/user/self" in req.full_url:
+                return FakeResponse({"data": {"quota": quota["v"]}})
+            if "/api/user/checkin" in req.full_url:
+                if req.get_method() == "POST":
+                    quota["v"] = 1500
+                    return FakeResponse({"success": True})
+                return FakeResponse({"data": {"stats": {
+                    "checked_in_today": False, "checkin_count": 1}}})
+            return FakeResponse({"data": {}})
+
+        with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
+            ok, msg, raw = wb_stations.checkin(sid)
+        self.assertTrue(ok)
+        self.assertIn("500", msg)
+
+
 # ---- 模型能力字段 -----------------------------------------------------
 
 class ModelCapabilityTests(unittest.TestCase):
