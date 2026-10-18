@@ -1424,22 +1424,28 @@ def _browser_available():
 
 
 def solver_status():
-    """面板展示用：打码服务是否已配置。"""
+    """面板展示用：打码服务是否已配置、镜像里有没有浏览器、用的哪个引擎。"""
     configured = False
     try:
         import wb_solver
         configured = bool(wb_solver.configured())
     except Exception:
         configured = False
+    engine = ""
+    try:
+        import wb_browser
+        engine = wb_browser.engine()
+    except Exception:
+        engine = ""
     return {"provider": "capsolver", "configured": configured,
-            "browser": _browser_available()}
+            "browser": bool(engine), "engine": engine}
 
 
-def _browser_checkin(snap):
-    """用无头浏览器跑站点自己的签到流程。
+def _browser_checkin(snap, urls, styles):
+    """用浏览器给站点铸一个 Turnstile token，再带 token 走 HTTP 签到。
 
-    返回 (ok, message, raw)；当前环境没有 playwright 时返回 None，
-    调用方就退回纯 HTTP 逻辑（并提示只能手动签到）。
+    返回 (ok, message, raw)；当前环境没有浏览器时返回 None，调用方退回纯 HTTP
+    逻辑（并提示只能手动签到）。
     """
     try:
         import wb_browser
@@ -1450,10 +1456,26 @@ def _browser_checkin(snap):
             return None
     except Exception:
         return None
+
+    # sitekey 优先从站点 /api/status 的 turnstile_site_key 读（New API 标准字段），
+    # 读不到再去页面里找。
+    sitekey = ""
     try:
-        return wb_browser.checkin(snap, accounts_dir=_accounts_dir(), log=_logmsg)
-    except Exception as exc:
-        return (False, "浏览器签到异常: %s" % str(exc)[:140], "")
+        import wb_solver
+        sitekey = wb_solver.fetch_sitekey(_root_url(snap))
+    except Exception:
+        sitekey = ""
+    if not sitekey:
+        sitekey = wb_browser.sitekey_from_page(
+            snap, accounts_dir=_accounts_dir(), log=_logmsg)
+    if not sitekey:
+        return (False, "没拿到站点的 Turnstile sitekey", "")
+
+    token, why = wb_browser.mint_turnstile(
+        snap, sitekey, accounts_dir=_accounts_dir(), log=_logmsg)
+    if not token:
+        return (False, why or "浏览器没能拿到 Turnstile token", "")
+    return _checkin_with_token(snap, token, urls, styles)
 
 
 def _checkin_url_variants(url):
@@ -1570,7 +1592,7 @@ def checkin(st_id, turnstile=None):
             _logmsg("stations   : 签到 %s -> ok（打码服务）%s"
                     % (snap.get("name"), sres[1]))
             return sres
-        res = _browser_checkin(snap)
+        res = _browser_checkin(snap, urls, styles)
         if res:
             bok, bmsg, braw = res
             if bok:
@@ -1643,7 +1665,7 @@ def checkin(st_id, turnstile=None):
                     if sres:
                         _logmsg("stations   : 打码 token 未被接受（%s）"
                                 % str(sres[1])[:100])
-                    res = _browser_checkin(snap)
+                    res = _browser_checkin(snap, urls, styles)
                     if res:
                         bok, bmsg, braw = res
                         if bok:

@@ -1,12 +1,19 @@
-name: Build browser image (experimental)
+name: Build browser image
 
-# 带无头 Chromium 的镜像（:browser 标签），给需要 Cloudflare Turnstile 的站点
-# 做自动签到用。**实验性**：实测幻城网安这类站点的 Turnstile 会拒绝自动化会话
-# （challenge-platform 的 /pat 返回 401，拿不到 token），不保证能用。
+# 带无头浏览器的镜像（:browser 标签），给需要 Cloudflare Turnstile 的站点做自动
+# 签到用。浏览器是 cloakbrowser（指纹打过补丁的 Chromium）——普通 Chromium 会被
+# Cloudflare 识破，cloakbrowser 实测能在幻城网安上铸出站点接受的 token。
 #
-# 只手动触发，不跟每次 push：这层要装 playwright + chromium，镜像约 1GB，
-# 自动跑会把每次提交的 CI 从 1 分钟拉到十几分钟。需要时在 Actions 里手动跑。
+# 每次推 main 都重建，保证 :browser 与 :latest 同步。装依赖 + 预下载浏览器那一层
+# 只有 Dockerfile.browser 变了才重跑，其余提交只重跑最后的 COPY，很快。
 on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'wb_*.py'
+      - 'dashboard.html'
+      - 'Dockerfile.browser'
+      - '.github/workflows/docker-build-browser.yml'
   workflow_dispatch:
 
 permissions:

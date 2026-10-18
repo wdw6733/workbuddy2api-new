@@ -359,27 +359,24 @@ class StationIdTests(unittest.TestCase):
 # ---- 浏览器签到（可选依赖） -------------------------------------------
 
 class BrowserCheckinTests(unittest.TestCase):
-    """wb_browser 在没有 playwright 的镜像里必须是「惰性可用」，不能报错。"""
+    """wb_browser 在没有 cloakbrowser/playwright 的镜像里必须「惰性可用」。"""
 
-    def test_available_is_false_without_playwright(self):
+    def test_available_and_engine_do_not_raise(self):
         import wb_browser
-        # 主镜像（alpine）不装 playwright；这里只要求不抛异常
         self.assertIn(wb_browser.available(), (True, False))
+        self.assertIn(wb_browser.engine(), ("cloakbrowser", "playwright", ""))
 
-    def test_parse_success_payload(self):
+    def test_mint_without_sitekey_fails_cleanly(self):
         import wb_browser
-        ok, msg = wb_browser._parse(json.dumps({
-            "data": {"checkin_date": "2026-10-18", "quota_awarded": 2246295},
-            "message": "签到成功", "success": True}))
-        self.assertTrue(ok)
-        self.assertIn("2246295", msg)
+        token, why = wb_browser.mint_turnstile({"base_url": "https://a.example.com"},
+                                              "")
+        self.assertEqual(token, "")
+        self.assertIn("sitekey", why)
 
-    def test_parse_failure_payload(self):
+    def test_root_strips_the_api_suffix(self):
         import wb_browser
-        ok, msg = wb_browser._parse(json.dumps({
-            "message": "Turnstile token 为空", "success": False}))
-        self.assertFalse(ok)
-        self.assertIn("Turnstile", msg)
+        st = {"base_url": "https://api.example.com/v1"}
+        self.assertEqual(wb_browser._root(st), "https://api.example.com")
 
     def test_checkin_without_browser_falls_back_to_hint(self):
         """镜像里没有浏览器时，签到要给出可读的手动提示，而不是崩掉。"""
@@ -394,7 +391,8 @@ class BrowserCheckinTests(unittest.TestCase):
             return FakeResponse({"data": {"stats": {"checked_in_today": False}}})
 
         with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
-            with mock.patch.object(wb_stations, "_browser_checkin", lambda snap: None):
+            with mock.patch.object(wb_stations, "_browser_checkin",
+                                   lambda snap, urls, styles: None):
                 ok, msg, raw = wb_stations.checkin(sid)
         self.assertFalse(ok)
         self.assertIn("人机验证", msg)
