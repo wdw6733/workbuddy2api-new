@@ -16833,9 +16833,13 @@ class Handler(BaseHTTPRequestHandler):
             st_id = str(payload.get("id") or "").strip()
             if not st_id:
                 return self._error(400, "id is required", "invalid_request_error")
-            ok, msg, raw = wb_stations.checkin(st_id)
+            # 可选的一次性 Cloudflare Turnstile token（幻城网安这类站点强制）
+            turnstile = str(payload.get("turnstile") or "").strip() or None
+            ok, msg, raw = wb_stations.checkin(st_id, turnstile=turnstile)
+            st = wb_stations.get_station(st_id) or {}
             return self._json(200, {"ok": ok, "message": msg,
-                                    "resp": (raw or "")[:400]})
+                                    "resp": (raw or "")[:2000],
+                                    "needs_turnstile": bool(st.get("needs_turnstile"))})
         if path == "/stations/login":
             st_id = str(payload.get("id") or "").strip()
             if not st_id:

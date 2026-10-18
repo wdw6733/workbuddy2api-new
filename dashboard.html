@@ -4301,9 +4301,20 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         <div style="font-size:12px;color:var(--dim);margin-bottom:6px">站点原始返回</div>
         <pre id="stationCheckinRaw" style="max-height:42vh;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-all;margin:0"></pre>
         <p class="hint" style="margin:10px 0 0">
-          签到失败时看这里：返回里没有「已签到」或奖励字段，说明该地址只查询状态，
-          真正执行签到的接口需要用 F12 → Network 在站点上点一次「签到」抓出来。
+          签到失败时看这里：返回里没有「已签到」或奖励字段，说明该地址只查询状态；
+          返回里出现 Turnstile，说明站点要求人机验证——网关无法自动生成 token，
+          只能手动签到（或在下面粘贴一个新鲜的 token 试一次）。
         </p>
+        <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line)">
+          <div style="font-size:12px;color:var(--dim);margin-bottom:4px">
+            Turnstile token（可选，仅「需要人机验证」的站点用；一次性、约 5 分钟有效）
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <input id="stationCheckinTurnstile" class="slot-input" style="flex:1;min-width:220px"
+                   placeholder="1.0_...（F12 → Network → 签到请求的 turnstile 参数）">
+            <button class="sec" onclick="retryStationCheckin(true)">带 token 签到</button>
+          </div>
+        </div>
       </div>
       <div class="modal-ft">
         <button class="sec" onclick="closeStationCheckin()">关闭</button>
@@ -14894,6 +14905,8 @@ function renderStations(){
     // 余额已单独成列，说明里去掉服务端拼的那段，避免重复
     let note = (st.note || '').replace(/｜余额 [^｜]*/g, '');
     if(shared > 0){ note += '｜' + shared + ' 个模型多站共享（自动故障转移）'; }
+    // 签到强制人机验证的站点：自动签到必然失败，明确标出来
+    if(st.needs_turnstile){ note += '｜签到需人机验证（请手动签到）'; }
     // 最近一次签到结果：只放时间与成败；点开可看完整返回（排查接口用）
     const lc = st.last_checkin || null;
     let lcHtml = '';
@@ -15101,6 +15114,8 @@ async function checkinStation(id){
       if(r.resp) console.warn('[station checkin] ' + who + ' resp:', r.resp);
     }
     await loadStations();
+    // 需要人机验证的站点：直接把详情弹窗打开，让用户粘贴一次性 token 重试
+    if(!r.ok && r.needs_turnstile && stationById(id)) openStationCheckin(id);
   } catch(e){
     toast('签到失败：' + e.message, 'bad');
   } finally {
@@ -15141,22 +15156,40 @@ function openStationCheckin(id){
   let pretty = raw;
   try { pretty = JSON.stringify(JSON.parse(raw), null, 2); } catch(e) {}
   document.getElementById('stationCheckinRaw').textContent = pretty || '（站点没有返回内容）';
+  // 一次性 token 每次打开都清空；需要人机验证的站点直接把焦点放过去
+  const tEl = document.getElementById('stationCheckinTurnstile');
+  if(tEl){
+    tEl.value = '';
+    if(st.needs_turnstile){ setTimeout(function(){ try{ tEl.focus(); }catch(e){} }, 60); }
+  }
   document.getElementById('stationCheckinModal').classList.add('show');
 }
 function closeStationCheckin(){
   document.getElementById('stationCheckinModal').classList.remove('show');
 }
-async function retryStationCheckin(){
+async function retryStationCheckin(withToken){
   const id = _stationCheckinTarget;
   if(!id) return;
+  const body = { id: id };
+  if(withToken){
+    const el = document.getElementById('stationCheckinTurnstile');
+    const token = el ? el.value.trim() : '';
+    if(!token){ toast('请先粘贴 turnstile token', 'warn'); return; }
+    body.turnstile = token;
+  }
   const btn = document.getElementById('stationCheckinRetry');
   if(btn){ btn.disabled = true; btn.textContent = '签到中…'; }
   try {
-    const r = await postJSON('/stations/checkin', { id: id });
+    const r = await postJSON('/stations/checkin', body);
     const st = stationById(id);
     const who = st ? st.name : '站点';
     if(r.ok){ toast(who + ' 签到：' + (r.message || '成功'), 'ok'); }
     else { toast(who + ' 签到未生效：' + (r.message || '未知原因'), 'bad'); }
+    // token 是一次性的，用过就清掉，避免误以为还能复用
+    if(withToken){
+      const el = document.getElementById('stationCheckinTurnstile');
+      if(el) el.value = '';
+    }
     await loadStations();
     if(stationById(id)) openStationCheckin(id);
   } catch(e){

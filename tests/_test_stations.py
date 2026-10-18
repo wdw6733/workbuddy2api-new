@@ -158,6 +158,14 @@ class CheckinInterpretTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("鉴权", msg)
 
+    def test_turnstile_is_reported_as_such(self):
+        """幻城网安这类站点：签到强制 Cloudflare Turnstile，要单独识别。"""
+        ok, msg, evidence = wb_stations._checkin_interpret(
+            json.dumps({"message": "Turnstile token 为空", "success": False}))
+        self.assertFalse(ok)
+        self.assertEqual(evidence, "turnstile")
+        self.assertIn("人机验证", msg)
+
     def test_checkin_url_variants(self):
         self.assertEqual(wb_stations._checkin_url_variants("https://a/api/user/checkin"),
                          ["https://a/api/user/checkin", "https://a/api/user/check_in"])
@@ -264,6 +272,49 @@ class CheckinRequestTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("没有执行签到", msg)
         self.assertFalse(wb_stations.get_station(sid)["last_checkin"]["ok"])
+
+    def test_turnstile_station_is_flagged_and_stops_retrying(self):
+        """站点要求人机验证时：只发一次动作就收工，并把站点标记出来。"""
+        sid = add()
+        wb_stations.update_station(sid, checkin_url="https://api.example.com/api/user/checkin",
+                                   checkin_method="POST")
+        posts = []
+
+        def fake_urlopen(req, timeout=None):
+            if req.get_method() == "POST":
+                posts.append(req.full_url)
+                return FakeResponse({"message": "Turnstile token 为空",
+                                     "success": False})
+            return FakeResponse({"data": {"stats": {"checked_in_today": False}}})
+
+        with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
+            ok, msg, raw = wb_stations.checkin(sid)
+        self.assertFalse(ok)
+        self.assertIn("人机验证", msg)
+        self.assertEqual(len(posts), 1)          # 不在别的方法/地址上白试
+        self.assertTrue(wb_stations.get_station(sid)["needs_turnstile"])
+
+    def test_turnstile_token_is_appended_to_the_action_url(self):
+        sid = add()
+        wb_stations.update_station(sid, checkin_url="https://api.example.com/api/user/checkin",
+                                   checkin_method="POST")
+        seen = []
+
+        def fake_urlopen(req, timeout=None):
+            seen.append((req.get_method(), req.full_url))
+            if req.get_method() == "POST":
+                return FakeResponse({"message": "签到成功", "success": True,
+                                     "data": {"checkin_date": "2026-10-18",
+                                              "quota_awarded": 2246295}})
+            return FakeResponse({"data": {"stats": {"checked_in_today": False}}})
+
+        with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
+            ok, msg, raw = wb_stations.checkin(sid, turnstile="1.0_abc")
+        self.assertTrue(ok)
+        post_urls = [u for m, u in seen if m == "POST"]
+        self.assertEqual(post_urls, ["https://api.example.com/api/user/checkin?turnstile=1.0_abc"])
+        self.assertIn("2246295", msg)
+        self.assertFalse(wb_stations.get_station(sid)["needs_turnstile"])
 
     def test_checkin_failure_is_recorded(self):
         sid = add()

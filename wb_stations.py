@@ -17,6 +17,7 @@ import itertools
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import http.cookiejar
 
@@ -143,6 +144,7 @@ def add_station(name, base_url, api_key, enabled=True, priority=0, checkin_url="
         "models_selected": [],
         "models_all": [],
         "models_meta": {},
+        "needs_turnstile": False,
         "status": _station_default_status(),
     }
     with _LOCK:
@@ -782,6 +784,8 @@ def view():
             item["session_cookie_set"] = bool(str(st.get("session_cookie") or "").strip())
             item.pop("session_cookie", None)
             item["last_checkin"] = st.get("last_checkin")
+            # 该站点签到需要 Cloudflare Turnstile：面板要提示「只能手动签到」
+            item["needs_turnstile"] = bool(st.get("needs_turnstile"))
             out.append(item)
         return out
 
@@ -1096,6 +1100,12 @@ _ALREADY_CHECKED = ("已签到", "已经签到", "已领取", "今日已", "重�
 _FAIL_WORDS = ("未登录", "未提供", "无权", "无权限", "失败", "错误", "非法",
                "token", "unauthorized", "forbidden", "error", "fail")
 
+# 需要 Cloudflare Turnstile 人机验证的站点：签到请求必须带一个由浏览器端 JS
+# 生成的一次性 token（约 5 分钟过期），纯 HTTP 网关无法自行生成。
+TURNSTILE_HINT = ("该站点签到需要 Cloudflare Turnstile 人机验证，网关无法自动完成。"
+                  "请在浏览器里签到；若手上有一个新鲜的 turnstile token，"
+                  "可在「签到详情」里粘贴后重试。")
+
 
 # 真正「签到入账」才会出现的奖励字段
 _CHECKIN_REWARD_KEYS = ("checkin_quota", "quota", "reward", "added_quota",
@@ -1250,6 +1260,10 @@ def _checkin_interpret(body, status=200, is_action=False):
         return (False, "接口返回的是网页而不是 JSON：鉴权未通过，"
                        "请填站点「系统访问令牌」或 session cookie", "none")
     low = text[:600].lower()
+    # Turnstile 人机验证：请求里没有一次性 token 时站点只会回这句话，
+    # 换方法/换地址都没用，必须让用户知道这是硬性限制。
+    if "turnstile" in low:
+        return (False, TURNSTILE_HINT, "turnstile")
     try:
         data = json.loads(text)
     except Exception:
@@ -1262,6 +1276,8 @@ def _checkin_interpret(body, status=200, is_action=False):
         return (True, text[:120], "none")
     ok = data.get("success")
     msg = str(data.get("message") or data.get("msg") or "").strip()
+    if "turnstile" in msg.lower():
+        return (False, TURNSTILE_HINT, "turnstile")
     stats = _checkin_stats(data)
     evidence = _checkin_evidence(data, stats, is_action=is_action)
     if ok is False:
@@ -1284,6 +1300,29 @@ def _checkin_interpret(body, status=200, is_action=False):
     if any(w in msg or w in msg.lower() for w in _FAIL_WORDS):
         return (False, msg[:120] or "签到失败", "none")
     return (True, msg[:120] or "站点返回成功", evidence)
+
+
+def _with_query(url, **params):
+    """给 URL 追加查询参数（保留原有参数；空值跳过）。"""
+    parts = []
+    for key, value in params.items():
+        if value in (None, ""):
+            continue
+        parts.append("%s=%s" % (urllib.parse.quote(str(key), safe=""),
+                                urllib.parse.quote(str(value), safe="")))
+    if not parts:
+        return url
+    sep = "&" if "?" in url else "?"
+    return url + sep + "&".join(parts)
+
+
+def _mark_turnstile(st_id, flag):
+    """记录/清除「该站点签到需要人机验证」的标记（每日自动签到会跳过）。"""
+    with _LOCK:
+        st = _find(st_id)
+        if st and bool(st.get("needs_turnstile")) != bool(flag):
+            st["needs_turnstile"] = bool(flag)
+            save()
 
 
 def _checkin_url_variants(url):
@@ -1329,12 +1368,14 @@ def _checkin_status_probe(snap, urls, styles):
     return (None, None, "", "")
 
 
-def checkin(st_id):
+def checkin(st_id, turnstile=None):
     """调用站点签到接口，返回 (ok, message, raw_body)。
 
     签到接口在不同 fork 上差异很大：`/checkin` 与 `/check_in`、GET 与 POST，
     而且很多站点的 **GET 只查今天签没签、POST 才真正入账**——这正是「面板报
-    签到成功、站内却没有记录」的根源。
+    签到成功、站内却没有记录」的根源。少数站点（幻城网安等）还强制 Cloudflare
+    Turnstile：`POST /api/user/checkin?turnstile=<token>` 才受理，token 由浏览器
+    端 JS 生成、一次性、约 5 分钟过期，网关无法自行生成，只能由用户粘贴。
 
     因此按这个顺序走：
       1. 先 GET 查状态：今天已签就直接返回「已签到」，**不发签到动作**，
@@ -1343,6 +1384,8 @@ def checkin(st_id):
          逐个尝试，只认带签到证据（奖励字段 / checked_in_today / 明确文案）的响应；
       3. 动作做完再复核一次状态，确认真的入账；
       4. 全部试完仍未确认，就如实返回失败并附上原始返回，不再谎报成功。
+
+    turnstile: 可选的一次性人机验证 token，给了就拼到签到地址的查询参数上。
     """
     with _LOCK:
         st = _find(st_id)
@@ -1359,6 +1402,8 @@ def checkin(st_id):
     methods = [configured] + [m for m in ("POST", "GET") if m != configured]
     urls = _checkin_url_variants(url)
     styles = _auth_styles(snap)
+    # 签到动作要带上 turnstile token；查状态不需要
+    action_urls = [_with_query(u, turnstile=turnstile) for u in urls] if turnstile else urls
 
     last_error = ""
     raw = ""
@@ -1381,6 +1426,7 @@ def checkin(st_id):
         raw = status_raw
         msg = _already_message(stats)
         _record(True, msg, {"url": status_url, "method": "GET", "phase": "status"})
+        _mark_turnstile(st_id, False)
         _logmsg("stations   : 签到 %s -> 已签到，跳过动作 (%s)" % (snap.get("name"), msg))
         return (True, msg, raw)
 
@@ -1389,7 +1435,7 @@ def checkin(st_id):
     max_attempts = 6
     for method in methods:
         method_done = False
-        for try_url in urls:
+        for try_url in action_urls:
             if method_done:
                 break
             for style in styles:
@@ -1426,9 +1472,18 @@ def checkin(st_id):
                 if ok and evidence in ("confirmed", "already"):
                     _record(True, msg, {"url": try_url, "method": method,
                                         "auth": style, "phase": "action"})
+                    _mark_turnstile(st_id, False)
                     _logmsg("stations   : 签到 %s -> ok (%s) %s %s resp=%s"
                             % (snap.get("name"), msg, method, try_url, raw[:400]))
                     return (True, msg, raw)
+                if evidence == "turnstile":
+                    # 人机验证是硬性门槛，换方法/地址都没用，直接收工
+                    _mark_turnstile(st_id, True)
+                    _record(False, msg, {"url": try_url, "method": method,
+                                         "turnstile_required": True})
+                    _logmsg("stations   : 签到 %s -> 需要 Turnstile（%s %s）resp=%s"
+                            % (snap.get("name"), method, try_url, raw[:200]))
+                    return (False, msg, raw)
                 if ok:
                     # 成功但没证据：空壳 success / 只回了状态。
                     # 地址是通的（能返回合法 JSON），问题在方法，换方法即可。
@@ -1484,11 +1539,18 @@ def _daily_checkin_loop():
                 done_dates["date"] = today
                 with _LOCK:
                     targets = [s["id"] for s in _STATIONS
-                               if s.get("enabled") and str(s.get("checkin_url") or "").strip()]
+                               if s.get("enabled")
+                               and str(s.get("checkin_url") or "").strip()]
+                    # 需要人机验证的站点自动签到必然失败，跳过并只提示一次
+                    skipped = [s.get("name") for s in _STATIONS
+                               if s.get("enabled") and s.get("needs_turnstile")]
                 for sid in targets:
                     checkin(sid)
                 if targets:
                     _logmsg("stations   : 每日自动签到完成（%d 个站点）" % len(targets))
+                if skipped:
+                    _logmsg("stations   : 跳过 %d 个需要人机验证的站点（请手动签到）：%s"
+                            % (len(skipped), "、".join(str(n) for n in skipped)))
         except Exception:
             pass
         time.sleep(1800)  # 每半小时检查一次
