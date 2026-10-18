@@ -16944,7 +16944,19 @@ class Handler(BaseHTTPRequestHandler):
             pass
         data = [model_entry(mid, meta) for mid, meta in entries]
         # 公益站勾选的模型并入统一清单，owned_by=station，命名带 @站点 后缀消歧。
-        data.extend(wb_stations.models_entries())
+        # 与官方清单重名的条目跳过：同一个 ID 在 /v1/models 里出现两次会让
+        # 部分客户端（Cherry Studio / NextChat）的模型选择器出现重复项。
+        # 请求路由不受影响——同名时 resolve() 仍会先命中公益站。
+        seen = set()
+        for item in data:
+            mid = item.get("id")
+            if isinstance(mid, str):
+                seen.add(mid)
+        for item in wb_stations.models_entries():
+            if item.get("id") in seen:
+                continue
+            seen.add(item.get("id"))
+            data.append(item)
         payload = {"object": "list", "data": data,
                    "realm": req_realm or CURRENT_REALM}
         # 来源说明（面板展示用）：这批清单是上游 API 实时取的，还是读的

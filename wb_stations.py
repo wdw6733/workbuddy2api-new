@@ -12,11 +12,17 @@
 """
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
 import urllib.request
 import http.cookiejar
+
+try:  # 模型上下文/输出上限的四级查找（上游值 > 内建表 > model.json > models.dev）
+    import wb_modelsdev
+except Exception:  # pragma: no cover - 单文件运行时降级
+    wb_modelsdev = None
 
 # 浏览器 UA：公益站普遍套了 Cloudflare/WAF，Python 默认 UA（Python-urllib）
 # 会被直接 403，全部请求统一带浏览器 UA。
@@ -125,6 +131,7 @@ def add_station(name, base_url, api_key, enabled=True, priority=0, checkin_url="
         "priority": priority,
         "models_selected": [],
         "models_all": [],
+        "models_meta": {},
         "status": _station_default_status(),
     }
     with _LOCK:
@@ -177,6 +184,7 @@ def update_station(st_id, name=None, base_url=None, api_key=None, enabled=None,
         # 地址或密钥变了，旧测活结果不再可信
         st["status"] = _station_default_status()
         st["models_all"] = []
+        st["models_meta"] = {}
         save()
         _rebuild_routes()
         return st
@@ -254,7 +262,7 @@ def probe(st_id):
         if not st:
             return None
         snap = json.loads(json.dumps(st))
-    state, latency, detail, models = _probe_once(snap)
+    state, latency, detail, models, meta = _probe_once(snap)
     with _LOCK:
         st = _find(st_id)
         if not st:
@@ -267,12 +275,102 @@ def probe(st_id):
         }
         if state == "ok":
             st["models_all"] = models
+            # 站点自己在 /v1/models 里给出的能力字段（上下文/输出/思考）留档，
+            # 供 /v1/models 聚合时优先采用；站点不报就由内建知识表兜底。
+            st["models_meta"] = meta
             # 测活通过说明站点已恢复，清除它的失败冷却
             clear_cooling(st_id)
             # 新发现的模型不自动勾选；仅当用户从未勾选过时提示在面板上选
         save()
         _rebuild_routes()
         return json.loads(json.dumps(st))
+
+
+def _int_or_zero(value):
+    try:
+        n = int(float(value))
+    except (TypeError, ValueError):
+        return 0
+    return n if 0 < n <= 10 ** 9 else 0
+
+
+def _model_meta_from_item(it):
+    """从站点 /v1/models 的单项里抽出能力相关字段。
+
+    公益站的上游五花八门（New API / One API / OpenRouter 兼容层 / vLLM），
+    字段命名没有统一标准，这里把见过的写法都收一遍；取不到就留空，
+    交给 _model_caps 的知识表兜底。
+    """
+    if not isinstance(it, dict):
+        return {}
+    meta = {}
+    top = it.get("top_provider") if isinstance(it.get("top_provider"), dict) else {}
+    arch = it.get("architecture") if isinstance(it.get("architecture"), dict) else {}
+    caps = it.get("capabilities") if isinstance(it.get("capabilities"), dict) else {}
+    for field in ("context_length", "context_window", "max_input_tokens",
+                  "max_context_length", "max_model_len", "context_size"):
+        v = _int_or_zero(it.get(field))
+        if v:
+            meta["context_length"] = v
+            break
+    if "context_length" not in meta:
+        v = _int_or_zero(top.get("context_length"))
+        if v:
+            meta["context_length"] = v
+    for field in ("max_output_tokens", "max_completion_tokens", "max_tokens",
+                  "max_output"):
+        v = _int_or_zero(it.get(field))
+        if v:
+            meta["max_output_tokens"] = v
+            break
+    if "max_output_tokens" not in meta:
+        v = _int_or_zero(top.get("max_completion_tokens"))
+        if v:
+            meta["max_output_tokens"] = v
+
+    params = it.get("supported_parameters")
+    params = [str(p).lower() for p in params] if isinstance(params, list) else []
+
+    vision = it.get("vision")
+    if vision is None:
+        vision = it.get("supports_vision")
+    if vision is None:
+        vision = caps.get("vision")
+    if vision is None:
+        mods = arch.get("input_modalities") or it.get("input_modalities")
+        if isinstance(mods, list):
+            vision = "image" in [str(x).lower() for x in mods]
+    if isinstance(vision, bool):
+        meta["vision"] = vision
+
+    tools = it.get("supports_tool_calls")
+    if tools is None:
+        tools = caps.get("tool_calls")
+    if tools is None and params:
+        tools = "tools" in params or "tool_choice" in params
+    if isinstance(tools, bool):
+        meta["tool_calls"] = tools
+
+    thinks = it.get("supports_reasoning")
+    if thinks is None:
+        thinks = caps.get("reasoning")
+    if thinks is None:
+        r = it.get("reasoning") if isinstance(it.get("reasoning"), dict) else None
+        if r is not None:
+            thinks = True
+        elif params:
+            thinks = any(p in params for p in ("reasoning", "reasoning_effort",
+                                               "thinking", "include_reasoning"))
+    if isinstance(thinks, bool):
+        meta["reasoning"] = thinks
+
+    efforts = it.get("reasoning_efforts")
+    if not isinstance(efforts, list):
+        r = it.get("reasoning") if isinstance(it.get("reasoning"), dict) else {}
+        efforts = r.get("supportedEfforts") or r.get("efforts") or r.get("levels")
+    if isinstance(efforts, list) and efforts:
+        meta["reasoning_efforts"] = [str(e) for e in efforts if str(e).strip()]
+    return meta
 
 
 def _probe_once(st):
@@ -286,32 +384,36 @@ def _probe_once(st):
             try:
                 data = json.loads(body)
             except Exception:
-                return ("no_models", latency, "HTTP %d 但响应不是 JSON" % resp.status, [])
+                return ("no_models", latency, "HTTP %d 但响应不是 JSON" % resp.status, [], {})
             items = data.get("data") if isinstance(data, dict) else None
             if not isinstance(items, list):
                 items = []
             models = []
+            meta_map = {}
             for it in items:
                 mid = it.get("id") if isinstance(it, dict) else None
                 if isinstance(mid, str) and mid and mid not in models:
                     models.append(mid)
+                    m = _model_meta_from_item(it)
+                    if m:
+                        meta_map[mid] = m
             if not models:
-                return ("no_models", latency, "接口通了但没返回模型", [])
-            return ("ok", latency, "", models)
+                return ("no_models", latency, "接口通了但没返回模型", [], {})
+            return ("ok", latency, "", models, meta_map)
     except urllib.error.HTTPError as exc:
         latency = int((time.time() - t0) * 1000)
         try:
             exc.read(200)
         except Exception:
             pass
-        return ("unavailable", latency, "HTTP %d" % exc.code, [])
+        return ("unavailable", latency, "HTTP %d" % exc.code, [], {})
     except urllib.error.URLError as exc:
         latency = int((time.time() - t0) * 1000)
         reason = getattr(exc, "reason", exc)
-        return ("unavailable", latency, "连接失败: %s" % reason, [])
+        return ("unavailable", latency, "连接失败: %s" % reason, [], {})
     except Exception as exc:
         latency = int((time.time() - t0) * 1000)
-        return ("unavailable", latency, str(exc)[:120], [])
+        return ("unavailable", latency, str(exc)[:120], [], {})
 
 
 def probe_all_async():
@@ -430,12 +532,140 @@ def resolve(model):
         return alive
 
 
+def _accounts_dir():
+    """accounts 目录（模型知识表缓存 model.json 也放这儿）。"""
+    return os.path.dirname(_STATIONS_FILE) if _STATIONS_FILE else "."
+
+
+# 模型能力的名称推断表。公益站的 /v1/models 大多只回 id，不报上下文/输出/
+# 思考档位；这里按模型族给出共识值，站点自己报了就以站点为准。
+# 顺序有意义：先匹配到的先用，所以具体族在前、泛化规则在后。
+# 每项：(正则, 思考档位, 能否关闭思考, 固定档位)
+_REASONING_HINTS = (
+    (r"^(gpt-5|gpt-6|o[1-9]($|-|_))", ("minimal", "low", "medium", "high"), False, None),
+    (r"^gpt-oss", ("low", "medium", "high"), False, None),
+    (r"^claude.*(think|reason)|^claude-(3[.-]?7|[4-9])|^claude.*(sonnet|opus)",
+     ("low", "medium", "high"), True, None),
+    (r"^deepseek.*(r1|reasoner)", ("low", "medium", "high"), True, None),
+    (r"^deepseek-v[3-9]", ("low", "medium", "high"), True, None),
+    (r"^(glm-?z1|glm-?[4-9])", ("low", "medium", "high"), True, None),
+    (r"^(qwen3|qwq)", ("low", "medium", "high"), True, None),
+    (r"^gemini-[2-9]", ("low", "medium", "high"), True, None),
+    (r"^grok-[3-9]", ("low", "medium", "high"), True, None),
+    (r"^(minimax-m[2-9]|step-[23]|doubao.*(think|pro)|hunyuan.*(t1|think))",
+     ("low", "medium", "high"), True, None),
+    (r"(think|reason)", ("low", "medium", "high"), True, None),
+)
+
+# 视觉能力只认明确的型号标记：误报会让客户端把图片发给不支持读图的上游。
+_VISION_HINTS = re.compile(
+    r"(vision|multimodal|-vl\b|[-_]vl[-_]|4v\b|omni|pixtral|llava|internvl"
+    r"|^gpt-4o|^gpt-5|^gpt-6|^gemini|^claude|^qwen.*vl|^glm-4\.?[0-9]?v)", re.I)
+
+
+def _model_caps(mid, meta=None):
+    """推断一个公益站模型的能力：上下文窗口 / 最大输出 / 思考档位 / 视觉 / 工具。
+
+    优先级：站点 /v1/models 上报的字段 > wb_modelsdev 四级查找（内建表 +
+    model.json + models.dev 缓存）> 名称推断。返回值直接铺进 /v1/models 条目，
+    面板的「上下文窗口 / 最大输出 / 思考档位」三列就是读这些字段。
+    """
+    meta = meta if isinstance(meta, dict) else {}
+    remote_ctx = _int_or_zero(meta.get("context_length"))
+    remote_out = _int_or_zero(meta.get("max_output_tokens"))
+    ctx, out, src = remote_ctx or 1000000, remote_out or None, "upstream"
+    if wb_modelsdev is not None:
+        try:
+            ctx, out, info = wb_modelsdev.lookup(
+                mid, remote_ctx, remote_out, directory=_accounts_dir())
+            src = "upstream" if remote_ctx or remote_out else (
+                "knowledge" if (info or {}).get("context") in ("table", "cache") else "default")
+        except Exception:
+            pass
+    caps = {"context_length": ctx, "source": src}
+    if out:
+        caps["max_output_tokens"] = out
+
+    name = str(mid or "").lower()
+    vision = meta.get("vision")
+    if not isinstance(vision, bool):
+        vision = bool(_VISION_HINTS.search(name))
+    tools = meta.get("tool_calls")
+    if not isinstance(tools, bool):
+        tools = True  # OpenAI 兼容站基本都支持 tool_calls
+    thinks = meta.get("reasoning")
+    efforts = meta.get("reasoning_efforts") or []
+    can_disable = None
+    fixed = None
+    if not isinstance(thinks, bool):
+        thinks = False
+        for pattern, hint_efforts, hint_can_disable, hint_fixed in _REASONING_HINTS:
+            if re.search(pattern, name):
+                thinks = True
+                efforts = efforts or list(hint_efforts)
+                can_disable = hint_can_disable
+                fixed = hint_fixed
+                break
+    caps.update({
+        "vision": bool(vision),
+        "tool_calls": bool(tools),
+        "reasoning": bool(thinks),
+        "reasoning_efforts": list(efforts),
+        "reasoning_can_disable": can_disable,
+        "reasoning_fixed_effort": fixed,
+    })
+    return caps
+
+
+def _apply_caps(entry, caps):
+    """把能力字段铺到 /v1/models 条目上（字段名对齐官方模型条目，面板直接读）。"""
+    ctx = caps.get("context_length")
+    out = caps.get("max_output_tokens")
+    vision = bool(caps.get("vision"))
+    tools = bool(caps.get("tool_calls"))
+    thinks = bool(caps.get("reasoning"))
+    inputs = ["text"] + (["image"] if vision else [])
+    entry["context_length"] = ctx
+    entry["max_input_tokens"] = ctx
+    if out:
+        entry["max_output_tokens"] = out
+        entry["max_completion_tokens"] = out
+    entry["capabilities"] = {"vision": vision, "tool_calls": tools, "reasoning": thinks}
+    entry["supports_vision"] = vision
+    entry["supports_images"] = vision
+    entry["supports_tool_calls"] = tools
+    entry["supports_reasoning"] = thinks
+    entry["vision"] = vision
+    entry["multimodal"] = vision
+    entry["abilities"] = {"vision": vision, "functionCall": tools,
+                          "function_call": tools, "reasoning": thinks}
+    entry["input_modalities"] = inputs
+    entry["output_modalities"] = ["text"]
+    entry["modalities"] = {"input": inputs, "output": ["text"]}
+    entry["architecture"] = {"input_modalities": inputs,
+                             "output_modalities": ["text"],
+                             "modality": "+".join(inputs) + "->text"}
+    efforts = caps.get("reasoning_efforts") or []
+    if efforts:
+        entry["reasoning_efforts"] = efforts
+    if caps.get("reasoning_fixed_effort"):
+        entry["reasoning_fixed_effort"] = caps["reasoning_fixed_effort"]
+    if caps.get("reasoning_can_disable") is not None:
+        entry["reasoning_can_disable"] = bool(caps["reasoning_can_disable"])
+    entry["capability_source"] = caps.get("source") or "default"
+    return entry
+
+
 def models_entries():
     """构造公益站模型在 /v1/models 里的条目（OpenAI 兼容形状）。
 
     同名模型合并为单一裸 ID 条目（附 upstreams 列出所有提供站）；
     `模型ID@站点名` 作为强制指定保留解析能力，但不在列表里列出，
     避免模型选择器刷出一堆重复项。
+
+    能力字段（上下文窗口 / 最大输出 / 思考档位 / 视觉 / 工具）优先取站点
+    /v1/models 自报的值，站点没报就按模型族知识表推断，字段名与官方模型
+    条目一致，面板「网关模型清单」的三列能力直接就能显示。
     """
     with _LOCK:
         entries = []
@@ -445,20 +675,19 @@ def models_entries():
             cands = _ROUTE_TABLE[mid]
             upstreams = []
             desc = None
+            meta = None
             for st_id, real_mid in cands:
                 st = _find(st_id)
                 if not st:
                     continue
-                meta = None
-                for it in st.get("models_all") or []:
-                    if isinstance(it, str) and it == real_mid:
-                        meta = {}
-                        break
-                    if isinstance(it, dict) and it.get("id") == real_mid:
-                        meta = it
-                        break
-                if desc is None and isinstance(meta, dict):
-                    desc = meta.get("description")
+                m = (st.get("models_meta") or {}).get(real_mid)
+                if isinstance(m, dict) and m:
+                    meta = m  # 第一个报了能力的站点优先
+                if desc is None:
+                    for it in st.get("models_all") or []:
+                        if isinstance(it, dict) and it.get("id") == real_mid:
+                            desc = it.get("description")
+                            break
                 upstreams.append({
                     "id": st_id,
                     "name": st.get("name"),
@@ -484,6 +713,7 @@ def models_entries():
                     "upstreams": upstreams,
                 },
             }
+            _apply_caps(entry, _model_caps(mid, meta))
             entries.append(entry)
         return entries
 
@@ -521,22 +751,16 @@ def view():
             else:
                 note = "尚未测活"
             item["note"] = note
-            # 余额展示（New API / One API 兼容探测）
+            # 余额展示（New API / One API 兼容探测，已按站点配额单位换算）
             bal = st.get("balance")
             if isinstance(bal, dict):
                 item["balance"] = bal
                 if bal.get("error"):
                     note += "｜余额查询失败"
-                else:
-                    remain = bal.get("remain_quota")
-                    if remain is None:
-                        remain = bal.get("quota")
-                    if remain is not None:
-                        try:
-                            note += "｜余额 $%.2f" % float(remain)
-                        except Exception:
-                            pass
+                elif bal.get("display"):
+                    note += "｜余额 " + str(bal["display"])
             item["note"] = note
+            item["models_meta"] = st.get("models_meta") or {}
             item["checkin_url"] = st.get("checkin_url") or ""
             item["checkin_method"] = st.get("checkin_method") or "GET"
             item["checkin_token_set"] = bool(str(st.get("checkin_token") or "").strip())
@@ -591,10 +815,107 @@ def _balance_url(st):
     return _root_url(st) + "/api/user/self"
 
 
+# New API / One API 的余额是整数配额（quota），不是货币：默认 500000 quota
+# = $1。直接把 quota 当美元显示会放大 50 万倍（面板曾显示 ¥1003188200，
+# 实际 ¥14646.55）。站点的 /api/status 会给出真实换算参数，优先用它。
+QUOTA_PER_UNIT_DEFAULT = float(os.environ.get("WB_STATIONS_QUOTA_PER_UNIT", "500000") or 500000)
+EXCHANGE_RATE_DEFAULT = float(os.environ.get("WB_STATIONS_USD_CNY", "7.3") or 7.3)
+
+
+def _fetch_status_units(st):
+    """GET {root}/api/status：读站点的配额换算参数。
+
+    New API 返回 quota_per_unit / display_in_currency / usd_exchange_rate
+    （不同版本大小写不一），One API 一般只有 quota_per_unit。取不到就用默认值。
+    """
+    info = {}
+    try:
+        req = urllib.request.Request(
+            _root_url(st) + "/api/status",
+            headers={"Accept": "application/json", "User-Agent": _BROWSER_UA},
+            method="GET")
+        with urllib.request.urlopen(req, timeout=BALANCE_TIMEOUT) as resp:
+            data = json.loads(resp.read(256 * 1024).decode("utf-8", "replace"))
+    except Exception:
+        return info
+    d = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(d, dict):
+        return info
+    for key in ("quota_per_unit", "QuotaPerUnit", "quotaPerUnit"):
+        try:
+            v = float(d.get(key))
+        except (TypeError, ValueError):
+            continue
+        if v > 0:
+            info["quota_per_unit"] = v
+            break
+    for key in ("usd_exchange_rate", "UsdExchangeRate", "usdExchangeRate"):
+        try:
+            v = float(d.get(key))
+        except (TypeError, ValueError):
+            continue
+        if v > 0:
+            info["usd_exchange_rate"] = v
+            break
+    for key in ("display_in_currency", "DisplayInCurrencyEnabled",
+                "displayInCurrency", "display_in_currency_enabled"):
+        if isinstance(d.get(key), bool):
+            info["display_in_currency"] = d[key]
+            break
+    return info
+
+
+def _apply_money(balance, quota_value, qpu, rate, currency):
+    """把整数配额换算成金额，写进 balance 的 usd / cny / display 字段。"""
+    try:
+        quota = float(quota_value)
+    except (TypeError, ValueError):
+        return balance
+    if quota < 0 or qpu <= 0:
+        return balance
+    usd = quota / qpu
+    cny = usd * rate
+    balance["usd"] = round(usd, 4)
+    balance["cny"] = round(cny, 2)
+    if currency == "USD":
+        balance["display"] = "$%.2f" % usd
+        balance["display_alt"] = "¥%.2f" % cny
+    else:
+        balance["display"] = "¥%.2f" % cny
+        balance["display_alt"] = "$%.2f" % usd
+    return balance
+
+
+_AUTH_WORDS = ("无权", "未登录", "未提供", "无效", "令牌", "token 无效",
+               "token无效", "unauthorized", "forbidden", "not logged")
+
+
+def _auth_failed(status, body):
+    """判断一次用户级接口调用是不是「鉴权没通过」（而不是业务失败）。
+
+    New API 鉴权失败经常回 HTTP 200 + {"success": false, "message": "无权进行
+    此操作，access token 无效"}，只看状态码会误判成成功。
+    """
+    if status in (401, 403):
+        return True
+    text = (body or "")[:600]
+    if not text:
+        return False
+    try:
+        data = json.loads(text)
+    except Exception:
+        return False
+    if not isinstance(data, dict) or data.get("success") is True:
+        return False
+    msg = str(data.get("message") or data.get("msg") or "").lower()
+    return any(w in msg for w in _AUTH_WORDS)
+
+
 def fetch_balance(st_id):
     """探测站点余额（New API / One API 的 /api/user/self）。
 
-    宽容解析 quota / used_quota / remain_quota 字段，写入站点 balance。
+    宽容解析 quota / used_quota / remain_quota 字段，并按站点的
+    quota_per_unit / usd_exchange_rate 换算成金额写入站点 balance。
     返回 (ok, balance_dict)；失败返回 (False, None)。
     """
     with _LOCK:
@@ -604,16 +925,35 @@ def fetch_balance(st_id):
         return (False, None)
     t0 = time.time()
     try:
-        headers = _user_api_headers(snap)
-        req = urllib.request.Request(_balance_url(snap), headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=BALANCE_TIMEOUT) as resp:
-            body = resp.read(512 * 1024).decode("utf-8", "replace")
+        body = ""
+        styles = _auth_styles(snap)
+        for idx, style in enumerate(styles):
+            headers = _user_api_headers(snap, style)
+            req = urllib.request.Request(_balance_url(snap), headers=headers,
+                                         method="GET")
+            try:
+                with urllib.request.urlopen(req, timeout=BALANCE_TIMEOUT) as resp:
+                    body = resp.read(512 * 1024).decode("utf-8", "replace")
+                    status = getattr(resp, "status", 200)
+            except urllib.error.HTTPError as exc:
+                if exc.code in (401, 403) and idx + 1 < len(styles):
+                    continue
+                raise
+            if _auth_failed(status, body) and idx + 1 < len(styles):
+                # 令牌写法不对（New API 老版本不剥 Bearer）→ 换一种再试
+                continue
+            break
         data = json.loads(body)
         d = data.get("data") if isinstance(data, dict) else None
         if not isinstance(d, dict):
-            return (False, None)
+            # 有的站把失败原因放在 message 里（HTTP 200 + success:false）
+            msg = ""
+            if isinstance(data, dict):
+                msg = str(data.get("message") or "")[:80]
+            raise ValueError(msg or "返回结构里没有 data")
         # 不同版本字段各异，能做几个算几个
-        balance = {"checked_at": time.time(), "latency_ms": int((time.time() - t0) * 1000)}
+        balance = {"checked_at": time.time(),
+                   "latency_ms": int((time.time() - t0) * 1000)}
         for f in ("quota", "used_quota", "remain_quota", "request_count"):
             if d.get(f) is not None:
                 balance[f] = d[f]
@@ -625,12 +965,37 @@ def fetch_balance(st_id):
         # 用户名用于展示
         if d.get("username"):
             balance["username"] = d["username"]
+        # 配额换算参数：站点 /api/status 优先，取不到用默认 500000 quota = $1
+        units = _fetch_status_units(snap)
+        qpu = units.get("quota_per_unit") or QUOTA_PER_UNIT_DEFAULT
+        rate = units.get("usd_exchange_rate") or EXCHANGE_RATE_DEFAULT
+        currency = "CNY" if units.get("display_in_currency", True) else "USD"
+        balance.update({"quota_per_unit": qpu, "usd_exchange_rate": rate,
+                        "currency": currency})
+        remain = balance.get("remain_quota")
+        if remain is None:
+            remain = balance.get("quota")
+        if remain is not None:
+            _apply_money(balance, remain, qpu, rate, currency)
+        elif d.get("balance") is not None:
+            # 少数 fork 直接回金额
+            try:
+                amount = float(d["balance"])
+                balance["display"] = ("¥%.2f" % amount if currency == "CNY"
+                                      else "$%.2f" % amount)
+            except (TypeError, ValueError):
+                pass
+        if balance.get("used_quota") is not None:
+            try:
+                balance["used_usd"] = round(float(balance["used_quota"]) / qpu, 4)
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
         with _LOCK:
             st = _find(st_id)
             if st:
                 st["balance"] = balance
                 save()
-        _logmsg("stations   : 余额 %s -> %s" % (snap.get("name"), balance))
+        _logmsg("stations   : 余额 %s -> %s" % (snap.get("name"), balance.get("display")))
         return (True, balance)
     except Exception as exc:
         with _LOCK:
@@ -666,32 +1031,135 @@ def set_checkin_url(st_id, checkin_url):
         return st
 
 
-def _user_api_headers(st):
+def _auth_styles(st):
+    """用户级接口的 Authorization 写法候选（按成功率排序）。
+
+    New API 的 UserAuth 中间件直接把 Authorization 头当 access token 查库，
+    老版本 / One API 不剥 "Bearer " 前缀；新版本才剥。所以先发原始令牌，
+    失败再发 "Bearer xxx"。只有 API Key（sk-）时才反过来。
+    """
+    if str(st.get("session_cookie") or "").strip():
+        return ["cookie"]
+    token = str(st.get("checkin_token") or "").strip()
+    if token:
+        return ["raw", "bearer"]
+    if str(st.get("api_key") or "").strip():
+        return ["bearer", "raw"]
+    return ["none"]
+
+
+def _user_api_headers(st, style="auto"):
     """用户级接口（签到/余额）的请求头。
 
     支持三种鉴权（按优先级）：
       1. session cookie —— OAuth 登录站（AnyRouter / AgentRouter 等）专用，
          登录后浏览器里的 session cookie + New-Api-User 头
-      2. 系统访问令牌 —— New API 系的 checkin_token（个人设置生成）
+      2. 系统访问令牌 —— New API 系的 checkin_token（个人设置生成），
+         原始值直接放 Authorization（不加 Bearer）
       3. API Key —— 少数用 sk- 鉴权的站
+    style: "auto"/"raw"/"bearer"/"cookie" 控制 Authorization 的写法。
     """
     headers = {"Accept": "application/json", "User-Agent": _BROWSER_UA}
+    if style == "auto":
+        styles = _auth_styles(st)
+        style = styles[0] if styles else "none"
     cookie = str(st.get("session_cookie") or "").strip()
-    if cookie:
+    if cookie and style != "bearer":
         # 用户填了纯 session 值 → 拼成 session=xxx；填了完整 cookie 头 → 原样用
         headers["Cookie"] = cookie if ("=" in cookie and (";" in cookie or cookie.startswith("session="))) else ("session=" + cookie)
-    else:
+    elif style != "cookie":
         token = str(st.get("checkin_token") or "").strip() or str(st.get("api_key") or "").strip()
         if token:
-            headers["Authorization"] = "Bearer " + token
+            if style == "raw":
+                headers["Authorization"] = token
+            elif style == "bearer":
+                headers["Authorization"] = "Bearer " + token
     uid = str(st.get("checkin_user_id") or "").strip()
     if uid:
         headers["New-Api-User"] = uid
     return headers
 
 
+_ALREADY_CHECKED = ("已签到", "已经签到", "已领取", "今日已", "重复签到",
+                    "already", "checked in", "already checked")
+_FAIL_WORDS = ("未登录", "未提供", "无权", "无权限", "失败", "错误", "非法",
+               "token", "unauthorized", "forbidden", "error", "fail")
+
+
+def _checkin_interpret(body, status=200):
+    """解析签到响应，返回 (ok, message)。
+
+    只认 HTTP 2xx 会把「HTTP 200 + success:false」当成签到成功——面板提示
+    成功、站内却没有签到记录，正是这个原因。这里按 New API / One API 的返回
+    约定判定：
+        {"success": true,  "message": "", "data": {"quota": 500000}}
+        {"success": false, "message": "今天已经签到过了"}
+    「今天已签到」不算失败（状态是好的），只是没有新增收益。
+    """
+    text = (body or "").strip()
+    if not text:
+        return (True, "签到接口返回空内容")
+    if text[:1] == "<":
+        return (False, "接口返回的是网页而不是 JSON：鉴权未通过，"
+                       "请填站点「系统访问令牌」或 session cookie")
+    low = text[:600].lower()
+    try:
+        data = json.loads(text)
+    except Exception:
+        if any(w in text or w in low for w in _ALREADY_CHECKED):
+            return (True, "今天已签到（无需重复）")
+        if any(w in text or w in low for w in _FAIL_WORDS):
+            return (False, text[:120])
+        return (True, text[:120])
+    if not isinstance(data, dict):
+        return (True, text[:120])
+    ok = data.get("success")
+    msg = str(data.get("message") or data.get("msg") or "").strip()
+    payload = data.get("data")
+    reward = ""
+    if isinstance(payload, dict):
+        for key in ("quota", "reward", "added_quota", "credit", "points"):
+            if payload.get(key) is not None:
+                reward = str(payload[key])
+                break
+    elif isinstance(payload, (int, float)) and payload:
+        reward = str(payload)
+    if ok is False:
+        if any(w in msg or w in msg.lower() for w in _ALREADY_CHECKED):
+            return (True, "今天已签到（无需重复）")
+        return (False, msg or "站点拒绝了签到请求")
+    if ok is True:
+        out = msg or "签到成功"
+        if reward:
+            out += "（配额 +%s）" % reward
+        return (True, out)
+    # 没有 success 字段：按文案判断
+    if any(w in msg or w in msg.lower() for w in _ALREADY_CHECKED):
+        return (True, "今天已签到（无需重复）")
+    if any(w in msg or w in msg.lower() for w in _FAIL_WORDS):
+        return (False, msg[:120] or "签到失败")
+    return (True, msg[:120] or "签到成功")
+
+
+def _checkin_url_variants(url):
+    """签到地址的备选写法：New API 是 /checkin，部分 fork 是 /check_in。"""
+    url = str(url or "").strip()
+    if not url:
+        return []
+    out = [url]
+    if url.endswith("/checkin"):
+        out.append(url[: -len("/checkin")] + "/check_in")
+    elif url.endswith("/check_in"):
+        out.append(url[: -len("/check_in")] + "/checkin")
+    return out
+
+
 def checkin(st_id):
-    """调用站点配置的签到接口（方法/令牌/用户ID 均可配）。返回 (ok, message)。"""
+    """调用站点配置的签到接口（方法/令牌/用户ID 均可配）。
+
+    返回 (ok, message)：ok 为 True 表示站点确实记录了签到（或今天已签到），
+    不再只看 HTTP 状态码。
+    """
     with _LOCK:
         st = _find(st_id)
         snap = json.loads(json.dumps(st)) if st else None
@@ -703,38 +1171,58 @@ def checkin(st_id):
     method = str(snap.get("checkin_method") or "GET").upper()
     if method not in ("GET", "POST"):
         method = "GET"
-    try:
-        headers = _user_api_headers(snap)
-        data = b"{}" if method == "POST" else None
+    data = b"{}" if method == "POST" else None
+    styles = _auth_styles(snap)
+    last_error = ""
+    body = ""
+
+    def _record(ok, msg, extra=None):
+        with _LOCK:
+            st = _find(st_id)
+            if st:
+                rec = {"at": time.time(), "ok": bool(ok), "message": msg,
+                       "resp": (body or "")[:200]}
+                if extra:
+                    rec.update(extra)
+                st["last_checkin"] = rec
+                save()
+
+    for sidx, style in enumerate(styles):
+        headers = _user_api_headers(snap, style)
         if method == "POST":
             headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=BALANCE_TIMEOUT) as resp:
-            body = resp.read(256 * 1024).decode("utf-8", "replace")
-        msg = body[:200]
-        with _LOCK:
-            st = _find(st_id)
-            if st:
-                st["last_checkin"] = {"at": time.time(), "ok": True, "resp": msg}
-                save()
-        _logmsg("stations   : 签到 %s -> ok" % snap.get("name"))
-        return (True, msg)
-    except urllib.error.HTTPError as exc:
-        with _LOCK:
-            st = _find(st_id)
-            if st:
-                st["last_checkin"] = {"at": time.time(), "ok": False,
-                                      "resp": "HTTP %d" % exc.code}
-                save()
-        return (False, "HTTP %d" % exc.code)
-    except Exception as exc:
-        with _LOCK:
-            st = _find(st_id)
-            if st:
-                st["last_checkin"] = {"at": time.time(), "ok": False,
-                                      "resp": str(exc)[:120]}
-                save()
-        return (False, str(exc)[:120])
+        for idx, try_url in enumerate(_checkin_url_variants(url)):
+            try:
+                req = urllib.request.Request(try_url, data=data, headers=headers,
+                                             method=method)
+                with urllib.request.urlopen(req, timeout=BALANCE_TIMEOUT) as resp:
+                    body = resp.read(256 * 1024).decode("utf-8", "replace")
+                    status = getattr(resp, "status", 200)
+                ok, msg = _checkin_interpret(body, status)
+                # 鉴权写法不对（New API 老版本不剥 Bearer）：换下一种写法重试
+                if not ok and _auth_failed(status, body) and sidx + 1 < len(styles):
+                    last_error = msg
+                    break
+                _record(ok, msg, {"url": try_url, "auth": style})
+                _logmsg("stations   : 签到 %s -> %s (%s)"
+                        % (snap.get("name"), "ok" if ok else "fail", msg))
+                return (ok, msg)
+            except urllib.error.HTTPError as exc:
+                last_error = "HTTP %d" % exc.code
+                if exc.code in (401, 403):
+                    last_error = ("HTTP %d：鉴权未通过，请在站点里填「系统访问令牌」"
+                                  "或 session cookie" % exc.code)
+                    break  # 换鉴权写法
+                # 404/405 说明地址写法不对，换备选地址再试一次
+                if exc.code in (404, 405) and idx == 0:
+                    continue
+                break
+            except Exception as exc:
+                last_error = str(exc)[:120]
+                break
+
+    _record(False, last_error or "签到失败")
+    return (False, last_error or "签到失败")
 
 
 def _daily_checkin_loop():
@@ -806,28 +1294,52 @@ def login_station(st_id):
         user = data.get("data") or {}
         uid = str(user.get("id") or "").strip()
         token = str(user.get("access_token") or "").strip()
+        # 登录成功就拿到的 session cookie 也存下来：令牌生成失败时它是唯一可用的
+        # 用户级凭证（OAuth 站 / 部分 fork 只认 cookie）。
+        cookie_val = ""
+        for ck in cj:
+            if ck.name in ("session", "token"):
+                cookie_val = ck.value
+                break
         # 2. 响应没带令牌时，用 session cookie 调生成接口
         if not token:
-            req2 = urllib.request.Request(root + "/api/user/token",
-                                          headers=base_headers, method="GET")
-            with opener.open(req2, timeout=LOGIN_TIMEOUT) as resp2:
-                d2 = json.loads(resp2.read(256 * 1024).decode("utf-8", "replace"))
-            if isinstance(d2, dict) and d2.get("success"):
-                token = str(d2.get("data") or "").strip()
-        if not token:
+            try:
+                req2 = urllib.request.Request(root + "/api/user/token",
+                                              headers=base_headers, method="GET")
+                with opener.open(req2, timeout=LOGIN_TIMEOUT) as resp2:
+                    d2 = json.loads(resp2.read(256 * 1024).decode("utf-8", "replace"))
+                if isinstance(d2, dict) and d2.get("success"):
+                    token = str(d2.get("data") or "").strip()
+            except Exception:
+                pass
+        if not token and not cookie_val:
             return (False, "登录成功，但站点未返回访问令牌（可能需要先在站点个人设置里生成）")
         with _LOCK:
             st = _find(st_id)
             if st:
-                st["checkin_token"] = token
+                if token:
+                    st["checkin_token"] = token
+                if cookie_val:
+                    st["session_cookie"] = cookie_val
                 if uid:
                     st["checkin_user_id"] = uid
                 save()
-        _logmsg("stations   : 登录 %s -> 已获取系统访问令牌%s"
-                % (snap.get("name"), ("（用户 %s）" % uid) if uid else ""))
-        return (True, "已获取系统访问令牌" + ("（用户 %s）" % uid if uid else "")
-                + "，余额与签到现在可用")
+        _logmsg("stations   : 登录 %s -> %s%s"
+                % (snap.get("name"),
+                   "已获取系统访问令牌" if token else "已保存会话 Cookie",
+                   ("（用户 %s）" % uid) if uid else ""))
+        # 3. 立刻用新凭证查一次余额，验证真的能用
+        okb, bal = fetch_balance(st_id)
+        kind = "系统访问令牌" if token else "会话 Cookie"
+        head = "已获取%s%s" % (kind, ("（用户 %s）" % uid if uid else ""))
+        if okb and isinstance(bal, dict) and bal.get("display"):
+            return (True, head + "，余额 " + str(bal["display"]) + "，签到已可用")
+        return (True, head + "，但余额校验未通过："
+                + str((bal or {}).get("error") or "接口未返回数据"))
     except urllib.error.HTTPError as exc:
+        if exc.code == 400:
+            return (False, "登录失败: HTTP 400（站点可能开启了人机验证 Turnstile，"
+                           "请在站点里改用「系统访问令牌」或 session cookie）")
         return (False, "登录失败: HTTP %d" % exc.code)
     except Exception as exc:
         return (False, "登录失败: " + str(exc)[:120])

@@ -1,0 +1,246 @@
+"""公益站模块：余额单位换算、签到结果解析、模型能力字段。
+
+Run with: python tests/_test_stations.py
+No network: station HTTP calls are stubbed via unittest.mock.
+"""
+import json
+import os
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+_startup_dir = tempfile.TemporaryDirectory(prefix="stations-")
+os.environ["ACCOUNTS_DIR"] = _startup_dir.name
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import wb_stations
+
+
+class FakeResponse(object):
+    def __init__(self, payload, status=200):
+        if not isinstance(payload, bytes):
+            payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.payload = payload
+        self.status = status
+
+    def read(self, limit=None):
+        return self.payload[:limit] if limit else self.payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def reset():
+    """每个用例前重置模块状态到一份干净的站点清单。"""
+    wb_stations._STATIONS = []
+    wb_stations._ROUTE_TABLE = {}
+    wb_stations._COOLING.clear()
+    wb_stations._STATIONS_FILE = os.path.join(_startup_dir.name, "stations.json")
+    if os.path.exists(wb_stations._STATIONS_FILE):
+        os.remove(wb_stations._STATIONS_FILE)
+
+
+def add(name="mock", base="https://api.example.com/v1", **kw):
+    st = wb_stations.add_station(name, base, "sk-test-1234567890", **kw)
+    return st["id"]
+
+
+# ---- 余额：整数配额 -> 金额 -------------------------------------------
+
+class BalanceUnitsTests(unittest.TestCase):
+    """New API 的 quota 是整数单位（默认 500000 = $1），不是美元。"""
+
+    def setUp(self):
+        reset()
+
+    def test_quota_is_converted_not_shown_raw(self):
+        sid = add()
+        self_home = {"success": True, "data": {"quota": 1003188200,
+                                              "used_quota": 0,
+                                              "username": "wdw6734"}}
+        status = {"data": {"quota_per_unit": 500000,
+                           "display_in_currency": True,
+                           "usd_exchange_rate": 7.3}}
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url
+            if url.endswith("/api/status"):
+                return FakeResponse(status)
+            return FakeResponse(self_home)
+
+        with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
+            ok, bal = wb_stations.fetch_balance(sid)
+        self.assertTrue(ok)
+        # 1003188200 / 500000 = $2006.38；× 7.3 = ¥14646.55（站点页面上的数字）
+        self.assertEqual(bal["display"], "¥14646.55")
+        self.assertEqual(bal["display_alt"], "$2006.38")
+        self.assertAlmostEqual(bal["cny"], 14646.55, places=2)
+        self.assertEqual(bal["quota_per_unit"], 500000)
+
+    def test_defaults_when_status_endpoint_missing(self):
+        sid = add()
+        self_home = {"success": True, "data": {"quota": 500000, "used_quota": 0}}
+
+        def fake_urlopen(req, timeout=None):
+            if req.full_url.endswith("/api/status"):
+                raise OSError("no status endpoint")
+            return FakeResponse(self_home)
+
+        with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
+            ok, bal = wb_stations.fetch_balance(sid)
+        self.assertTrue(ok)
+        # 默认 500000 quota = $1，且默认按人民币展示
+        self.assertEqual(bal["display"], "¥7.30")
+        self.assertEqual(bal["usd"], 1.0)
+
+    def test_view_note_uses_money_not_raw_quota(self):
+        sid = add()
+        st = wb_stations.get_station(sid)
+        st["balance"] = {"quota": 1003188200, "display": "¥14646.55"}
+        with wb_stations._LOCK:
+            wb_stations._find(sid)["balance"] = st["balance"]
+        note = wb_stations.view()[0]["note"]
+        self.assertIn("¥14646.55", note)
+        self.assertNotIn("1003188200", note)
+
+
+# ---- 签到：HTTP 200 + success:false 不算成功 ---------------------------
+
+class CheckinInterpretTests(unittest.TestCase):
+
+    def test_success_true(self):
+        ok, msg = wb_stations._checkin_interpret(
+            json.dumps({"success": True, "message": "",
+                        "data": {"quota": 500000}}))
+        self.assertTrue(ok)
+        self.assertIn("签到成功", msg)
+        self.assertIn("500000", msg)
+
+    def test_success_false_is_failure(self):
+        ok, msg = wb_stations._checkin_interpret(
+            json.dumps({"success": False, "message": "签到接口维护中"}))
+        self.assertFalse(ok)
+        self.assertEqual(msg, "签到接口维护中")
+
+    def test_auth_failure_message_is_surfaced(self):
+        ok, msg = wb_stations._checkin_interpret(
+            json.dumps({"success": False,
+                        "message": "无权进行此操作，access token 无效"}))
+        self.assertFalse(ok)
+        self.assertIn("access token", msg)
+
+    def test_already_checked_in_is_not_a_failure(self):
+        ok, msg = wb_stations._checkin_interpret(
+            json.dumps({"success": False, "message": "今天已经签到过了"}))
+        self.assertTrue(ok)
+        self.assertIn("已签到", msg)
+
+    def test_html_body_means_auth_failed(self):
+        ok, msg = wb_stations._checkin_interpret("<html><body>login</body></html>")
+        self.assertFalse(ok)
+        self.assertIn("鉴权", msg)
+
+    def test_checkin_url_variants(self):
+        self.assertEqual(wb_stations._checkin_url_variants("https://a/api/user/checkin"),
+                         ["https://a/api/user/checkin", "https://a/api/user/check_in"])
+        self.assertEqual(wb_stations._checkin_url_variants("https://a/api/user/check_in"),
+                         ["https://a/api/user/check_in", "https://a/api/user/checkin"])
+
+
+class CheckinRequestTests(unittest.TestCase):
+
+    def setUp(self):
+        reset()
+
+    def test_checkin_reports_station_verdict(self):
+        sid = add()
+        wb_stations.update_station(sid, checkin_url="https://api.example.com/api/user/checkin",
+                                   checkin_method="POST")
+
+        def fake_urlopen(req, timeout=None):
+            return FakeResponse({"success": False, "message": "今日已签到"})
+
+        with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
+            ok, msg = wb_stations.checkin(sid)
+        self.assertTrue(ok)
+        self.assertIn("已签到", msg)
+        self.assertTrue(wb_stations.get_station(sid)["last_checkin"]["ok"])
+
+    def test_checkin_failure_is_recorded(self):
+        sid = add()
+        wb_stations.update_station(sid, checkin_url="https://api.example.com/api/user/checkin",
+                                   checkin_method="POST")
+
+        def fake_urlopen(req, timeout=None):
+            return FakeResponse({"success": False, "message": "服务异常"})
+
+        with mock.patch.object(wb_stations.urllib.request, "urlopen", fake_urlopen):
+            ok, msg = wb_stations.checkin(sid)
+        self.assertFalse(ok)
+        rec = wb_stations.get_station(sid)["last_checkin"]
+        self.assertFalse(rec["ok"])
+        self.assertEqual(rec["message"], "服务异常")
+
+
+# ---- 模型能力字段 -----------------------------------------------------
+
+class ModelCapabilityTests(unittest.TestCase):
+
+    def setUp(self):
+        reset()
+
+    def test_upstream_reported_limits_win(self):
+        sid = add()
+        wb_stations.set_selected_models(sid, ["claude-sonnet-4.5"])
+        with wb_stations._LOCK:
+            st = wb_stations._find(sid)
+            st["models_all"] = ["claude-sonnet-4.5"]
+            st["models_meta"] = {"claude-sonnet-4.5": {
+                "context_length": 200000, "max_output_tokens": 64000}}
+        entry = wb_stations.models_entries()[0]
+        self.assertEqual(entry["context_length"], 200000)
+        self.assertEqual(entry["max_output_tokens"], 64000)
+        self.assertEqual(entry["max_completion_tokens"], 64000)
+        self.assertEqual(entry["capability_source"], "upstream")
+
+    def test_reasoning_family_gets_efforts(self):
+        sid = add()
+        wb_stations.set_selected_models(sid, ["gpt-5.2"])
+        with wb_stations._LOCK:
+            wb_stations._find(sid)["models_all"] = ["gpt-5.2"]
+        entry = wb_stations.models_entries()[0]
+        self.assertTrue(entry["supports_reasoning"])
+        self.assertIn("medium", entry["reasoning_efforts"])
+        self.assertFalse(entry["reasoning_can_disable"])
+
+    def test_plain_model_is_not_marked_reasoning(self):
+        sid = add()
+        wb_stations.set_selected_models(sid, ["some-unknown-model-xyz"])
+        with wb_stations._LOCK:
+            wb_stations._find(sid)["models_all"] = ["some-unknown-model-xyz"]
+        entry = wb_stations.models_entries()[0]
+        self.assertFalse(entry["supports_reasoning"])
+        self.assertTrue(entry["supports_tool_calls"])
+        # 未知模型也要给出一个上下文值，不能缺字段
+        self.assertGreater(entry["context_length"], 0)
+
+    def test_shared_model_lists_all_upstreams(self):
+        a = add(name="站A", base="https://a.example.com/v1")
+        b = add(name="站B", base="https://b.example.com/v1")
+        for sid in (a, b):
+            wb_stations.set_selected_models(sid, ["gpt-5.2"])
+        entry = wb_stations.models_entries()[0]
+        self.assertEqual(entry["id"], "gpt-5.2")
+        self.assertEqual(entry["station"]["providers"], 2)
+        self.assertEqual(len(entry["station"]["upstreams"]), 2)
+        # @站点 形式不进清单
+        self.assertEqual(len(wb_stations.models_entries()), 1)
+        self.assertTrue(wb_stations.resolve("gpt-5.2@站A"))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

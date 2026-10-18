@@ -4196,11 +4196,12 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
             <th style="text-align:left">站点</th>
             <th style="text-align:left">状态</th>
             <th style="text-align:left">响应时间</th>
+            <th style="text-align:left">余额</th>
             <th style="text-align:left">说明</th>
             <th style="text-align:left">操作</th>
           </tr></thead>
           <tbody id="stationsTbody">
-            <tr><td colspan="5" style="color:var(--dim);text-align:center;padding:18px">加载中…</td></tr>
+            <tr><td colspan="6" style="color:var(--dim);text-align:center;padding:18px">加载中…</td></tr>
           </tbody>
         </table>
       </div>
@@ -4224,7 +4225,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         <input id="stationEditKey" class="slot-input" style="margin-bottom:12px" placeholder="sk-...（编辑时留空则保留原值）">
         <div style="font-size:12px;color:var(--dim);margin-bottom:4px">签到地址（可选）</div>
         <input id="stationEditCheckin" class="slot-input" style="margin-bottom:6px" placeholder="https://example.com/api/user/check_in">
-        <div class="hint" style="margin:0 0 12px">New API 系站点一般为 /api/user/check_in（POST）。用 F12 → Network 点签到按钮可抓到真实接口。</div>
+        <div class="hint" style="margin:0 0 12px">New API 系常见 <b>/api/user/checkin</b>（新版 POST、旧版 GET），部分 fork 是 <b>/api/user/check_in</b>——两种写法网关都会自动试一遍。用 F12 → Network 点站点上的签到按钮可抓到真实接口。</div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">
           <div style="flex:0 0 110px">
             <div style="font-size:12px;color:var(--dim);margin-bottom:4px">签到方法</div>
@@ -4239,7 +4240,8 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
           </div>
         </div>
         <div style="font-size:12px;color:var(--dim);margin-bottom:4px">系统访问令牌（可选，站点个人设置里生成）</div>
-        <input id="stationEditCheckinToken" class="slot-input" style="margin-bottom:12px" placeholder="留空则用站点 API Key">
+        <input id="stationEditCheckinToken" class="slot-input" style="margin-bottom:6px" placeholder="留空则用站点 API Key">
+        <div class="hint" style="margin:0 0 12px">要填「个人设置 → 生成系统访问令牌」得到的那串值，<b>不是</b> sk- 开头的 API Key。网关按原始令牌发 Authorization；站点要求 Bearer 前缀时会自动重试一次。</div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:6px">
           <div style="flex:1;min-width:140px">
             <div style="font-size:12px;color:var(--dim);margin-bottom:4px">站点登录账号（可选）</div>
@@ -14812,6 +14814,7 @@ let STATIONS_DATA = [];
 let STATIONS_LOADING = false;
 let _stationsEditModelsTarget = null;   // 当前正在勾选模型的站点 id
 let _stationsModelsAll = [];            // 该站点已发现模型清单
+let _stationsModelsMeta = {};           // 模型 -> 站点自报的能力字段（上下文/输出）
 let _stationsModelsSelected = [];       // 该站点已勾选模型清单
 
 async function loadStations(showToast){
@@ -14853,7 +14856,7 @@ function renderStations(){
   const tbody = document.getElementById('stationsTbody');
   if(!tbody) return;
   if(!STATIONS_DATA.length){
-    tbody.innerHTML = '<tr><td colspan="5" style="color:var(--dim);text-align:center;padding:22px">还没有站点，点击「添加站点」接入第一个公益站。</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" style="color:var(--dim);text-align:center;padding:22px">还没有站点，点击「添加站点」接入第一个公益站。</td></tr>';
     return;
   }
   // 统计每个模型被多少个站勾选，用于提示「多站共享可自动故障转移」
@@ -14866,8 +14869,21 @@ function renderStations(){
     const url = st.base_url || '';
     const pri = (st.priority != null) ? st.priority : 0;
     const shared = (st.models_selected || []).filter(function(m){ return shareCount[m] > 1; }).length;
-    let note = st.note || '';
+    // 余额已单独成列，说明里去掉服务端拼的那段，避免重复
+    let note = (st.note || '').replace(/｜余额 [^｜]*/g, '');
     if(shared > 0){ note += '｜' + shared + ' 个模型多站共享（自动故障转移）'; }
+    // 最近一次签到结果：只放时间与成败，完整文案放 title
+    const lc = st.last_checkin || null;
+    let lcText = '';
+    let lcTitle = '';
+    if(lc && lc.at){
+      const d = new Date(lc.at * 1000);
+      const hh = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
+      lcText = '｜签到' + (lc.ok ? '✓' : '✗') + ' ' + hh;
+      // 悬停看完整文案 + 站点原始返回，签到失败时靠它定位（鉴权 / 已签到 / 维护）
+      lcTitle = [lc.message, (lc.resp && lc.resp !== lc.message) ? ('原始返回：' + lc.resp) : '']
+        .filter(Boolean).join(' · ');
+    }
     html += '<tr>' +
       '<td><div style="font-weight:600">' + esc(st.name) +
           ' <span style="font-weight:400;color:var(--dim);font-size:11px">优先级 ' + pri + '</span></div>' +
@@ -14875,7 +14891,8 @@ function renderStations(){
           (st.enabled ? '' : '<span style="color:var(--warn,#d97706);font-size:11px">（已停用）</span>') + '</td>' +
       '<td>' + stationStateBadge(st) + '</td>' +
       '<td>' + stationLatency(st) + '</td>' +
-      '<td style="max-width:300px">' + esc(note) + '</td>' +
+      '<td>' + stationBalanceCell(st) + '</td>' +
+      '<td style="max-width:300px" title="' + esc(lcTitle) + '">' + esc(note + lcText) + '</td>' +
       '<td><div style="display:flex;gap:6px;flex-wrap:wrap">' +
         '<button class="sec mini" onclick="probeStation(\'' + st.id + '\')">测活</button>' +
         '<button class="sec mini" onclick="openStationModels(\'' + st.id + '\')">选模型</button>' +
@@ -14888,6 +14905,25 @@ function renderStations(){
       '</tr>';
   });
   tbody.innerHTML = html;
+}
+
+// 余额单元格：站点 /api/user/self 的整数配额按站点的 quota_per_unit 换算，
+// 服务端已经算好 display（本位币）与 display_alt（另一种货币），这里只负责显示。
+function stationBalanceCell(st){
+  const b = st.balance || {};
+  if(b.error){
+    return '<span style="color:var(--bad,#dc2626);font-size:11px" title="' + esc(b.error) + '">查询失败</span>';
+  }
+  if(!b.display){
+    return '<span style="color:var(--dim)">—</span>';
+  }
+  let html = '<div style="font-weight:600;font-variant-numeric:tabular-nums">' + esc(b.display) + '</div>';
+  const alt = b.display_alt ? esc(b.display_alt) : '';
+  const used = (b.used_usd != null && Number(b.used_usd) > 0)
+    ? '已用 $' + Number(b.used_usd).toFixed(2) : '';
+  const sub = [alt, used].filter(Boolean).join(' · ');
+  if(sub) html += '<div style="color:var(--dim);font-size:11px">' + sub + '</div>';
+  return html;
 }
 
 function stationById(id){
@@ -15004,14 +15040,18 @@ async function fetchStationBalance(id){
       const b = r.balance;
       if(b.error){ toast((st ? st.name : '站点') + ' 余额查询失败：' + b.error, 'bad'); }
       else {
-        const remain = (b.remain_quota != null) ? b.remain_quota : b.quota;
         let msg = (st ? st.name : '站点');
         if(b.username) msg += '（' + b.username + '）';
-        msg += ' 剩余 $' + (remain != null ? Number(remain).toFixed(2) : '未知');
+        // 服务端已按站点 quota_per_unit 换算：display 是站点本位币
+        msg += ' 剩余 ' + (b.display || '未知');
+        if(b.display_alt) msg += ' / ' + b.display_alt;
+        if(b.used_usd != null && Number(b.used_usd) > 0){
+          msg += '，已用 $' + Number(b.used_usd).toFixed(2);
+        }
         toast(msg, 'ok');
       }
     } else {
-      toast('未取到余额（可能该站不支持 /api/user/self）', 'bad');
+      toast('未取到余额（可能该站不支持 /api/user/self，或令牌未通过校验）', 'bad');
     }
     await loadStations();
   } catch(e){
@@ -15027,8 +15067,10 @@ async function checkinStation(id){
   if(btn){ btn.disabled = true; btn.textContent = '签到中…'; }
   try {
     const r = await postJSON('/stations/checkin', { id: id });
-    if(r.ok){ toast((st ? st.name : '站点') + ' 签到成功', 'ok'); }
-    else { toast('签到失败：' + r.message, 'bad'); }
+    // 服务端已按站点返回的 success/message 判定，不再把 HTTP 200 当成功
+    const who = st ? st.name : '站点';
+    if(r.ok){ toast(who + ' 签到：' + (r.message || '成功'), 'ok'); }
+    else { toast(who + ' 签到失败：' + (r.message || '未知原因'), 'bad'); }
     await loadStations();
   } catch(e){
     toast('签到失败：' + e.message, 'bad');
@@ -15064,12 +15106,19 @@ function openStationModels(id){
   _stationsEditModelsTarget = id;
   _stationsModelsAll = st.models_all || [];
   _stationsModelsSelected = (st.models_selected || []).slice();
+  _stationsModelsMeta = st.models_meta || {};
   document.getElementById('stationModelsMeta').textContent = st.name;
   renderStationModels();
   document.getElementById('stationModelsModal').classList.add('show');
 }
 function closeStationModels(){
   document.getElementById('stationModelsModal').classList.remove('show');
+}
+function stationFmtK(v){
+  const n = Number(v || 0);
+  if(!n) return '';
+  const k = Math.round(n / 1000);
+  return k >= 1000 ? (k / 1000) + 'M' : k + 'K';
 }
 function renderStationModels(){
   const box = document.getElementById('stationModelsList');
@@ -15081,11 +15130,22 @@ function renderStationModels(){
   let html = '';
   _stationsModelsAll.forEach(function(m){
     const on = _stationsModelsSelected.indexOf(m) >= 0;
+    // 站点自报的上下文 / 最大输出（没有就留空，不编造）
+    const meta = _stationsModelsMeta[m] || {};
+    const parts = [];
+    const ctx = stationFmtK(meta.context_length);
+    const out = stationFmtK(meta.max_output_tokens);
+    if(ctx) parts.push(ctx);
+    if(out) parts.push('输出 ' + out);
+    const cap = parts.length
+      ? ' <span style="color:var(--dim);font-size:11px">· ' + parts.join(' / ') + '</span>' : '';
     html += '<label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;min-width:180px">' +
-      '<input type="checkbox" data-m="' + esc(m) + '" ' + (on ? 'checked' : '') + ' style="margin:0">' + esc(m) + '</label>';
+      '<input type="checkbox" data-m="' + esc(m) + '" ' + (on ? 'checked' : '') + ' style="margin:0">' +
+      '<span style="word-break:break-all">' + esc(m) + cap + '</span></label>';
   });
   box.innerHTML = html;
-  if(hint) hint.textContent = '已选 ' + _stationsModelsSelected.length + ' / ' + _stationsModelsAll.length + ' 个模型。';
+  if(hint) hint.textContent = '已选 ' + _stationsModelsSelected.length + ' / ' + _stationsModelsAll.length +
+    ' 个模型。上下文/输出为站点上报值；站点没报的，网关模型清单里按模型族共识值补齐。';
 }
 function stationModelsToggle(on){
   const box = document.getElementById('stationModelsList');
