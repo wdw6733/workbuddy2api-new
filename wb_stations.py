@@ -805,24 +805,11 @@ def view():
                     note += "｜余额 " + str(bal["display"])
             item["note"] = note
             item["models_meta"] = st.get("models_meta") or {}
-            item["checkin_url"] = st.get("checkin_url") or ""
-            item["checkin_method"] = st.get("checkin_method") or "GET"
-            item["checkin_token_set"] = bool(str(st.get("checkin_token") or "").strip())
-            item["checkin_user_id"] = st.get("checkin_user_id") or ""
-            item["login_username"] = st.get("login_username") or ""
-            item["login_password_set"] = bool(str(st.get("login_password") or "").strip())
-            item.pop("login_password", None)
-            item["session_cookie_set"] = bool(str(st.get("session_cookie") or "").strip())
-            item.pop("session_cookie", None)
-            # 授权登录：只回传 provider 与「是否粘过 IdP cookie」，不回传 cookie 本身
-            item["oauth_provider"] = st.get("oauth_provider") or ""
-            item["has_idp_cookie"] = bool(str(st.get("idp_cookie") or "").strip())
-            item.pop("idp_cookie", None)
-            item["last_checkin"] = st.get("last_checkin")
-            # 该站点签到需要 Cloudflare Turnstile：面板要提示「只能手动签到」
-            item["needs_turnstile"] = bool(st.get("needs_turnstile"))
-            # 自动探测出来的签到方式（click / relogin / none）
-            item["caps"] = st.get("caps")
+            # 站点登录与签到相关字段不再对外暴露：面板已改为「点开站点手动签到」
+            for _k in ("checkin_url", "checkin_method", "checkin_token", "checkin_user_id",
+                       "login_username", "login_password", "session_cookie", "idp_cookie",
+                       "oauth_provider", "last_checkin", "needs_turnstile", "caps"):
+                item.pop(_k, None)
             out.append(item)
         return out
 
