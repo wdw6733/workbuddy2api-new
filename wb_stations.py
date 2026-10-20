@@ -317,7 +317,9 @@ def probe(st_id):
             "detail": detail,
             "checked_at": time.time(),
         }
-        if state == "ok":
+        if state in ("ok", "key_invalid"):
+            # key_invalid 时模型清单照样留档：面板的「选模型」弹窗要能打开，
+            # 用户才好确认该站点到底提供哪些模型。
             st["models_all"] = models
             # 站点自己在 /v1/models 里给出的能力字段（上下文/输出/思考）留档，
             # 供 /v1/models 聚合时优先采用；站点不报就由内建知识表兜底。
@@ -417,6 +419,41 @@ def _model_meta_from_item(it):
     return meta
 
 
+def _probe_key_invalid(st):
+    """probe 主请求通过后，补一次凭据有效性校验。
+
+    /v1/models 在多数 New API / One API 站点不校验 API Key（匿名也能拉清单），
+    「测活正常」不代表 Key 还有效——等客户端发 chat 时才由上游 401 背刺，
+    用户看到的是「API Key 无效或者没有权限访问该模型」，完全对不上号。
+    这里补打一次 /api/user/self（标准用户接口，必须有效凭据）：
+      401/403 或 success:false 的鉴错 -> 返回失效说明（面板标 key_invalid）
+      404（站点没这个端点）/ 网络错误   -> 返回 None，不误判
+    """
+    if not str(st.get("api_key") or "").strip():
+        return None
+    try:
+        req = urllib.request.Request(_balance_url(st),
+                                     headers=_user_api_headers(st),
+                                     method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=BALANCE_TIMEOUT) as resp:
+                body = _read_body(resp, 256 * 1024)
+                status = getattr(resp, "status", 200)
+        except urllib.error.HTTPError as exc:
+            try:
+                exc.read(200)
+            except Exception:
+                pass
+            if exc.code in (401, 403):
+                return "API Key 已失效（HTTP %d），请编辑站点更新" % exc.code
+            return None
+        if _auth_failed(status, body):
+            return "API Key 已失效，请编辑站点更新"
+        return None
+    except Exception:
+        return None
+
+
 def _probe_once(st):
     t0 = time.time()
     try:
@@ -443,6 +480,10 @@ def _probe_once(st):
                         meta_map[mid] = m
             if not models:
                 return ("no_models", latency, "接口通了但没返回模型", [], {})
+            # 主请求过了不代表 Key 有效：补一次凭据校验，失效了让面板直接显示
+            bad = _probe_key_invalid(st)
+            if bad:
+                return ("key_invalid", latency, bad, models, meta_map)
             return ("ok", latency, "", models, meta_map)
     except urllib.error.HTTPError as exc:
         latency = int((time.time() - t0) * 1000)

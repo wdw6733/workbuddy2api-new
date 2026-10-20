@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 from unittest import mock
 
 _startup_dir = tempfile.TemporaryDirectory(prefix="stations-")
@@ -338,9 +339,73 @@ class CheckinRequestTests(unittest.TestCase):
 
 # ---- 站点 id ---------------------------------------------------------
 
+# ---- probe 的 Key 校验：/v1/models 不校验 Key，测活正常 ≠ Key 有效 ----
+
+class ProbeKeyTests(unittest.TestCase):
+    """公益站面板去登录/签到后，「测活」仍要能发现站点 Key 失效。
+
+    /v1/models 在多数 New API / One API 站点匿名可访问，主探测通过不代表
+    Key 有效；补打一次 /api/user/self 才能识别。失效时 state=key_invalid，
+    面板显示「Key失效」，而不是等客户端发 chat 被上游 401 背刺。
+    """
+
+    def setUp(self):
+        reset()
+
+    @staticmethod
+    def _urlopen_for(user_self):
+        models = {"data": [{"id": "gpt-6-astra"}]}
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url
+            if url.endswith("/v1/models"):
+                return FakeResponse(models)
+            if url.endswith("/api/user/self"):
+                if isinstance(user_self, Exception):
+                    raise user_self
+                return FakeResponse(user_self)
+            return FakeResponse({"data": {}})
+        return fake_urlopen
+
+    def _probe_state(self, user_self):
+        sid = add()
+        with mock.patch.object(wb_stations.urllib.request, "urlopen",
+                               self._urlopen_for(user_self)):
+            st = wb_stations.probe(sid)
+        return st["status"], st
+
+    def test_valid_key_stays_ok(self):
+        status, st = self._probe_state({"success": True, "data": {"quota": 100}})
+        self.assertEqual(status["state"], "ok")
+        # key_invalid 与 ok 都要留档模型清单，否则「选模型」弹窗是空的
+        self.assertEqual(st["models_all"], ["gpt-6-astra"])
+
+    def test_401_marks_key_invalid(self):
+        status, st = self._probe_state(
+            urllib.error.HTTPError("https://x/api/user/self", 401, "Unauthorized", {}, None))
+        self.assertEqual(status["state"], "key_invalid")
+        self.assertIn("失效", status["detail"])
+        # 清单照常留档：用户要能打开「选模型」确认站点有哪些模型
+        self.assertEqual(st["models_all"], ["gpt-6-astra"])
+
+    def test_http200_success_false_marks_key_invalid(self):
+        status, _ = self._probe_state(
+            {"success": False, "message": "无权进行此操作，access token 无效"})
+        self.assertEqual(status["state"], "key_invalid")
+
+    def test_missing_user_endpoint_does_not_judge(self):
+        # 404：站点没有 /api/user/self 这个用户接口，不能误判成 Key 失效
+        status, _ = self._probe_state(
+            urllib.error.HTTPError("https://x/api/user/self", 404, "Not Found", {}, None))
+        self.assertEqual(status["state"], "ok")
+
+    def test_network_error_on_user_endpoint_does_not_judge(self):
+        status, _ = self._probe_state(OSError("connection reset"))
+        self.assertEqual(status["state"], "ok")
+
+
 class StationIdTests(unittest.TestCase):
     """id 只用毫秒时间戳会在同一毫秒内撞车（Linux 上批量添加必现）。"""
-
     def setUp(self):
         reset()
 

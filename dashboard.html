@@ -15957,11 +15957,13 @@ function stationStateBadge(st){
   const map = {
     ok: ['正常', 'var(--ok,#16a34a)'],
     no_models: ['无模型', 'var(--warn,#d97706)'],
+    key_invalid: ['Key失效', 'var(--bad,#dc2626)'],
     unavailable: ['不可用', 'var(--bad,#dc2626)'],
     unknown: ['未测活', 'var(--dim)']
   };
   const row = map[s] || map.unknown;
-  return '<span style="display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600;color:#fff;background:' + row[1] + '">' + row[0] + '</span>';
+  const detail = (st.status && st.status.detail) || '';
+  return '<span title="' + esc(detail) + '" style="display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600;color:#fff;background:' + row[1] + '">' + row[0] + '</span>';
 }
 
 function stationLatency(st){
