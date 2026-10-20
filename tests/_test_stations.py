@@ -631,8 +631,11 @@ class OAuthTests(unittest.TestCase):
         sid = add()
         wb_stations.update_station(sid, oauth_provider="linuxdo", idp_cookie="_t=secret")
         row = [s for s in wb_stations.view() if s["id"] == sid][0]
-        self.assertTrue(row["has_idp_cookie"])
-        self.assertNotIn("idp_cookie", row)
+        # 公益站面板已去掉登录/签到，登录与签到相关字段一律不得对外暴露
+        for key in ("idp_cookie", "has_idp_cookie", "oauth_provider", "login_username",
+                    "login_password", "session_cookie", "checkin_url", "checkin_method",
+                    "checkin_token", "checkin_user_id", "last_checkin", "needs_turnstile"):
+            self.assertNotIn(key, row)
 
 
 # ---- 模型能力字段 -----------------------------------------------------
