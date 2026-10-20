@@ -23,6 +23,13 @@
 LICENSE
 README.md
 dashboard.html
+console_tail.py
+ops/aliyun/install-updater.sh
+ops/aliyun/workbuddy2api-hub-updater.py
+ops/aliyun/workbuddy2api-hub-updater.service
+ops/aliyun/workbuddy2api-hub-updater.path
+ops/aliyun/workbuddy2api-hub-updater.conf
+ops/aliyun/workbuddy2api-hub-updater-app.conf
 
 start-wb-proxy.bat
 start-wb-proxy.command
@@ -47,6 +54,7 @@ wb_atrest.py
 wb_browser.py
 wb_catalog.py
 wb_egress.py
+wb_entitlements.py
 wb_fingerprint.py
 wb_identity.py
 wb_ipintel.py
@@ -56,12 +64,15 @@ wb_pricing.py
 wb_probes.py
 wb_prompt.py
 wb_proxy.py
+wb_quota_scan.py
 wb_scheduler.py
 wb_settings.py
 wb_solver.py
 wb_stations.py
 wb_tasks.py
 wb_updates.py
+wb_update_request.py
 wb_upstream_pool.py
 wb_webagent.py
 wb_webtools.py
+wb_window_probe.py

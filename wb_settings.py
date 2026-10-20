@@ -910,6 +910,83 @@ def set_credits_refresh_hours(accounts_dir, value):
     return hours
 
 
+#: 后台排程时段（CST 24 小时制）。默认值与旧版硬编码完全一致，老安装行为不变。
+DEFAULT_SCHEDULE_HOURS = {
+    "checkin": [9, 21],
+    "travel": [9, 21],
+    "keepalive": [22],
+    "cat": [1],
+}
+SCHEDULE_KEYS = ("checkin", "travel", "keepalive", "cat")
+
+
+def _normalize_hours(value):
+    """Coerce a list / comma string into sorted unique hours 0-23, or None."""
+    if isinstance(value, str):
+        raw = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        raw = list(value)
+    else:
+        return None
+    out = set()
+    for item in raw:
+        if isinstance(item, bool):
+            continue
+        try:
+            hour = int(str(item).strip())
+        except (TypeError, ValueError):
+            continue
+        if 0 <= hour <= 23:
+            out.add(hour)
+    return sorted(out) if out else None
+
+
+def schedule_hours(accounts_dir):
+    """Background schedule hours, falling back per key to the legacy defaults.
+
+    Missing / invalid / out-of-range / empty entries fall back to the default
+    for that key, so a hand-edited settings.json cannot stop the scheduler.
+    Comma-separated strings are accepted like the other settings readers.
+    """
+    raw = load(accounts_dir).get("schedule")
+    if not isinstance(raw, dict):
+        raw = {}
+    out = {}
+    for key in SCHEDULE_KEYS:
+        hours = _normalize_hours(raw.get(key))
+        out[key] = hours if hours is not None else list(DEFAULT_SCHEDULE_HOURS[key])
+    return out
+
+
+def set_schedule_hours(accounts_dir, value):
+    """Persist a partial schedule update; returns the normalized full schedule.
+
+    Unknown keys are ignored. A supplied key must contain at least one valid
+    hour, otherwise ValueError is raised so the caller can return a readable
+    400 instead of storing a schedule that silently does nothing.
+    """
+    if not isinstance(value, dict):
+        raise ValueError("schedule must be an object")
+    with _lock:
+        data = load(accounts_dir)
+        current = data.get("schedule")
+        if not isinstance(current, dict):
+            current = {}
+        merged = {}
+        for key in SCHEDULE_KEYS:
+            if key in value:
+                hours = _normalize_hours(value.get(key))
+                if hours is None:
+                    raise ValueError("schedule.%s must contain hours 0-23" % key)
+                merged[key] = hours
+            else:
+                hours = _normalize_hours(current.get(key))
+                merged[key] = hours if hours is not None else list(DEFAULT_SCHEDULE_HOURS[key])
+        data["schedule"] = merged
+        save(accounts_dir, data)
+    return merged
+
+
 def section_max_height(accounts_dir):
     """Panel window height cap in pixels; 0 means no limit.
 
@@ -949,6 +1026,61 @@ def set_section_max_height(accounts_dir, value):
         data[SECTION_MAX_HEIGHT_KEY] = number
         save(accounts_dir, data)
     return number
+
+
+# 一键配置写进客户端的模型清单（DSH / OpenCode / Crush / ZCode 会把这份清单
+# 抄进自己的配置）。键不存在表示「从未选过」：面板默认全部不勾选，一键配置
+# 退回完整目录；显式保存空列表表示「用户全部取消」，一键配置会拒绝写空清单
+# ——空清单会生成一个没有模型的 provider，客户端直接不可用。
+AGENT_MODELS_KEY = "agent_models"
+# 清单写进客户端配置后会被逐条展开；200 条已远超任何出口的模型数，上限只挡
+# 手编 settings.json 把客户端配置撑爆。
+MAX_AGENT_MODELS = 200
+
+
+def _clean_agent_models(models):
+    """清洗模型 id 列表：只留非空字符串、去重保序、限量。"""
+    out = []
+    seen = set()
+    if not isinstance(models, (list, tuple)):
+        return out
+    for item in models:
+        if not isinstance(item, str):
+            continue
+        mid = item.strip()
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        out.append(mid)
+        if len(out) >= MAX_AGENT_MODELS:
+            break
+    return out
+
+
+def agent_model_selection(accounts_dir):
+    """面板勾选的模型 id；None 表示还没保存过（与空列表语义不同）。
+
+    None 让一键配置退回完整目录（升级前的老安装行为）；[] 是用户明确全部
+    取消，一键配置会拒绝写一个空的模型清单。
+    """
+    with _lock:
+        data = load(accounts_dir)
+    raw = data.get(AGENT_MODELS_KEY)
+    if not isinstance(raw, list):
+        # 手编坏了的键（字符串 / 对象 / null）按「没保存过」处理：宁可按老行为
+        # 退回完整目录，也不要因为一条脏数据让一键配置永远拒绝写模型清单。
+        return None
+    return _clean_agent_models(raw)
+
+
+def set_agent_model_selection(accounts_dir, models):
+    """保存勾选并返回清洗后的列表；空列表也会落盘（它的语义是「全不勾」）。"""
+    cleaned = _clean_agent_models(models)
+    with _lock:
+        data = load(accounts_dir)
+        data[AGENT_MODELS_KEY] = cleaned
+        save(accounts_dir, data)
+    return cleaned
 
 
 def _clamp_refresh_minutes(value):
@@ -1283,6 +1415,28 @@ def set_free_model_credit_fallback(accounts_dir, enabled):
     return enabled
 
 
+def filter_models_by_key(accounts_dir):
+    """Whether /v1/models hides models the requesting key may not use.
+
+    Off by default: the endpoint has always advertised the upstream catalogue,
+    and an install that predates this setting keeps behaving exactly as it did.
+    When on, a key with a model restriction only sees the models it allows, so
+    clients that auto-discover the catalogue cannot pick one that is later
+    rejected at request time. Keys without a restriction still see everything.
+    """
+    return load(accounts_dir).get("filter_models_by_key") is True
+
+
+def set_filter_models_by_key(accounts_dir, enabled):
+    """Persist the /v1/models key filter toggle. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["filter_models_by_key"] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
 def auto_switch_product(accounts_dir):
     """Whether an upstream 429 may rotate an account's outbound identity.
 
@@ -1302,6 +1456,83 @@ def set_auto_switch_product(accounts_dir, enabled):
         data["auto_switch_product"] = enabled
         save(accounts_dir, data)
     return enabled
+
+
+#: 出站身份自动切换允许落在哪些身份上（默认三条都允许，保持旧行为）。
+AUTO_SWITCH_PRODUCTS = ("workbuddy", "vscode", "cli")
+
+
+def auto_switch_products(accounts_dir):
+    """Allowed target identities for the 429 auto-switch.
+
+    Defaults to all three so an install that predates this setting keeps the
+    old behaviour. Unknown entries are dropped rather than failing the read.
+    """
+    raw = load(accounts_dir).get("auto_switch_products")
+    if not isinstance(raw, list):
+        return list(AUTO_SWITCH_PRODUCTS)
+    out = []
+    for item in raw:
+        if isinstance(item, str) and item in AUTO_SWITCH_PRODUCTS and item not in out:
+            out.append(item)
+    return out
+
+
+def set_auto_switch_products(accounts_dir, products):
+    """Persist the allowed auto-switch identities. Returns the stored list.
+
+    Raises ValueError for anything that is not a list of known product ids, so
+    the panel gets a readable 400 instead of silently storing garbage.
+    """
+    if not isinstance(products, list):
+        raise ValueError("auto_switch_products must be a list")
+    clean = []
+    for item in products:
+        if not isinstance(item, str) or item not in AUTO_SWITCH_PRODUCTS:
+            raise ValueError("unknown auto-switch product: %r" % (item,))
+        if item not in clean:
+            clean.append(item)
+    with _lock:
+        data = load(accounts_dir)
+        data["auto_switch_products"] = clean
+        save(accounts_dir, data)
+    return clean
+
+
+#: X-Private-Data is the official client's "may this conversation train the
+#: model" declaration. auto keeps the per-identity value the gateway already
+#: sends; true/false override it for every identity (issue #516).
+IDENTITY_KEY = "identity"
+IDENTITY_PRIVATE_DATA_VALUES = ("auto", "true", "false")
+
+
+def identity_private_data(accounts_dir):
+    """The configured X-Private-Data override: auto, true or false."""
+    raw = load(accounts_dir).get(IDENTITY_KEY)
+    if not isinstance(raw, dict):
+        return "auto"
+    value = str(raw.get("private_data") or "auto").strip().lower()
+    return value if value in IDENTITY_PRIVATE_DATA_VALUES else "auto"
+
+
+def identity_config(accounts_dir):
+    return {"private_data": identity_private_data(accounts_dir)}
+
+
+def set_identity_private_data(accounts_dir, value):
+    """Persist the X-Private-Data override. Returns the normalized value."""
+    value = str(value or "auto").strip().lower()
+    if value not in IDENTITY_PRIVATE_DATA_VALUES:
+        raise ValueError("identity.private_data must be auto, true or false")
+    with _lock:
+        data = load(accounts_dir)
+        identity = data.get(IDENTITY_KEY)
+        if not isinstance(identity, dict):
+            identity = {}
+        identity["private_data"] = value
+        data[IDENTITY_KEY] = identity
+        save(accounts_dir, data)
+    return value
 
 
 def remaining_priority_enabled(accounts_dir):
@@ -1791,6 +2022,28 @@ def set_update_check_enabled(accounts_dir, enabled):
     return enabled
 
 
+def window_probe(accounts_dir):
+    """是否在模型额度窗口重置时刻主动发探针请求，抢占新一轮计时。
+
+    上游的免费额度窗口按「首次请求」起算，打满后 429 会给出 `reset at`。
+    到点若无人请求，新一轮窗口就不会开始，额度一直空转。默认开启：这是
+    本网关把窗口起点钉在重置那一刻的唯一手段。关掉它的部署回到旧行为——
+    429 只记冷却，等真实请求自己撞上重置点。
+    """
+    value = load(accounts_dir).get("window_probe")
+    return True if value is None else value is True
+
+
+def set_window_probe(accounts_dir, enabled):
+    """Persist the window-probe switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["window_probe"] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
 def update_check_state(accounts_dir):
     """The last-check bookkeeping: when it ran, and the version it saw.
 
@@ -1833,6 +2086,49 @@ def record_update_check(accounts_dir, at=None, success=False, latest_version="")
         data[UPDATE_CHECK_STATE_KEY] = state
         save(accounts_dir, data)
     return update_check_state(accounts_dir)
+
+
+def _clean_quota_scan_models(value):
+    """Normalize the watch list into model ids in the order given.
+
+    Ids are kept verbatim (they are sent upstream as `model`), only trimmed and
+    de-duplicated; a hand-edited settings.json usually holds a comma-separated
+    string, so both shapes are accepted.
+    """
+    if isinstance(value, str):
+        raw = re.split(r"[,;\n]", value)
+    elif isinstance(value, (list, tuple, set)):
+        raw = list(value)
+    else:
+        return []
+    out = []
+    for item in raw:
+        name = str(item or "").strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def quota_scan_models(accounts_dir):
+    """Model ids the operator asked to watch, whether throttled or not.
+
+    The window probe only knows about a quota line once something hit its 429;
+    this list is how a line can be checked *before* it is exhausted, so hitting
+    the limit is discovered on an idle timer instead of mid-request. Empty means
+    the feature is off, which is what an install that predates the setting reads
+    back as.
+    """
+    return _clean_quota_scan_models(load(accounts_dir).get("quota_scan_models"))
+
+
+def set_quota_scan_models(accounts_dir, models):
+    """Replace the watch list. Returns the stored list."""
+    cleaned = _clean_quota_scan_models(models)
+    with _lock:
+        data = load(accounts_dir)
+        data["quota_scan_models"] = cleaned
+        save(accounts_dir, data)
+    return cleaned
 
 
 _SLOT_ID_RE = re.compile(r"^slot-(\d+)$")

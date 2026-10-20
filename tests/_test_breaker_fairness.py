@@ -13,9 +13,11 @@
 
     python tests/_test_breaker_fairness.py
 """
+import io
 import json
 import os
 import socket
+import ssl
 import sys
 import time
 import types
@@ -103,6 +105,58 @@ class StrikeWindowTests(unittest.TestCase):
 
 
 class LocalNetworkClassifierTests(unittest.TestCase):
+    def test_wrapped_windows_transport_errors_are_transient(self):
+        for code in (10053, 10054, 10060):
+            for reason in (OSError(code, "连接已中断"),
+                           "[WinError %d] 连接已中断" % code):
+                exc = urllib.error.URLError(reason)
+                with self.subTest(code=code, reason=repr(reason)):
+                    self.assertFalse(P.looks_like_local_network(exc))
+                    self.assertTrue(P.is_transient(exc))
+        exc = urllib.error.URLError(ConnectionResetError("连接已中断"))
+        self.assertTrue(P.is_transient(exc))
+
+    def test_connection_refused_is_not_transient(self):
+        # Refused means nothing is listening (typically a dead per-account
+        # proxy): it must keep the cooldown path, not the retry path.
+        for reason in (ConnectionRefusedError(10061, "目标计算机积极拒绝"),
+                       ConnectionRefusedError(111, "Connection refused"),
+                       "[WinError 10061] 目标计算机积极拒绝"):
+            exc = urllib.error.URLError(reason)
+            with self.subTest(reason=repr(reason)):
+                self.assertFalse(P.looks_like_local_network(exc))
+                self.assertFalse(P.is_transient(exc))
+
+    def test_numeric_network_codes_match_whole_numbers(self):
+        for code in (100, 101, 113, 10050, 10051, 10065, 11001):
+            exc = urllib.error.URLError(OSError(code, "网络不可达"))
+            with self.subTest(local_code=code):
+                self.assertTrue(P.looks_like_local_network(exc))
+        for code in (1000, 10054, 100540, 1010, 1130, 13):
+            exc = urllib.error.URLError(OSError(code, "error"))
+            with self.subTest(other_code=code):
+                self.assertFalse(P.looks_like_local_network(exc))
+
+    def test_http_errors_without_response_are_not_os_failures(self):
+        # HTTPError delegates missing attributes to its response on Python
+        # 3.9. With fp=None, probing errno/winerror used to raise KeyError.
+        class DelegatingHTTPError(urllib.error.HTTPError):
+            # Model that Linux 3.9 lookup on every test platform, including
+            # Windows versions whose OSError slots return None instead.
+            def __getattribute__(self, name):
+                if name in ("errno", "winerror"):
+                    raise KeyError("file")
+                return super().__getattribute__(name)
+
+        for error_type in (urllib.error.HTTPError, DelegatingHTTPError):
+            for status in (401, 429, 502):
+                error = error_type("https://up", status, "HTTP failure", {}, None)
+                for exc in (error, urllib.error.URLError(error)):
+                    with self.subTest(status=status, error_type=error_type.__name__,
+                                      wrapped=exc is not error):
+                        self.assertFalse(P.looks_like_local_network(exc))
+                        self.assertEqual(P.is_transient(exc), status >= 500)
+
     def test_host_side_failures_are_recognised(self):
         cases = [
             socket.gaierror(-3, "Temporary failure in name resolution"),
@@ -180,6 +234,35 @@ class ChatPathTests(unittest.TestCase):
         self.assertNotIsInstance(ctx.exception, P.LocalNetworkError)
         self.assertGreaterEqual(self.account.fails, 1)
 
+    def test_model_scoped_500_does_not_charge_the_account(self):
+        body = io.BytesIO(
+            b'{"code":11134,"msg":"the model provider is temporarily unavailable"}')
+        failure = urllib.error.HTTPError(
+            "https://up", 500, "Internal Server Error", {}, body)
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._run(failure)
+        self.assertEqual(self.account.fails, 0, "模型级 5xx 不该记在账号头上")
+        self.assertEqual(self.account.breaker_until, 0.0)
+        self.assertIn("11134",
+                      P.read_http_error(ctx.exception).decode("utf-8"))
+
+    def test_plain_500_still_charges_the_account(self):
+        body = io.BytesIO(b'{"code":99999,"msg":"boom"}')
+        failure = urllib.error.HTTPError(
+            "https://up", 500, "Internal Server Error", {}, body)
+        with self.assertRaises(urllib.error.HTTPError):
+            self._run(failure)
+        self.assertGreaterEqual(self.account.fails, 1)
+
+    def test_model_scoped_penalty_escape_hatch(self):
+        body = io.BytesIO(b'{"code":11134,"msg":"model unavailable"}')
+        failure = urllib.error.HTTPError(
+            "https://up", 500, "Internal Server Error", {}, body)
+        with mock.patch.dict(os.environ, {"WB_MODEL_SCOPED_ERRORS_PENALIZE": "1"}):
+            with self.assertRaises(urllib.error.HTTPError):
+                self._run(failure)
+        self.assertGreaterEqual(self.account.fails, 1)
+
     def test_generic_failure_is_logged_with_the_account(self):
         """通用失败分支以前不写日志：账号被冷却，可事后查不到是谁、为什么。"""
         lines = []
@@ -241,6 +324,11 @@ class TestAllRouteTests(unittest.TestCase):
     def _call(self, payload, rows, network):
         handler = types.SimpleNamespace(
             _json=lambda code, body: {"code": code, "body": body})
+        # 本仓库的账号类面板出口统一走 _json_panel（`_redact_account_names` + `_json`）。
+        # 桩里补上同一语义，才能让「一键测试」的返回体走与生产一致的路径；断言本身
+        # 不看手机号，脱敏对这里的昵称是恒等变换。
+        handler._json_panel = lambda code, body: {
+            "code": code, "body": P._redact_account_names(body)}
         with mock.patch.object(P, "probe_account", lambda acc, model=None, timeout=30: dict(rows[0])), \
                 mock.patch.object(P, "probe_local_network", lambda realm: dict(network)):
             return P.Handler._route_accounts_test_all(handler, payload)
@@ -359,6 +447,118 @@ class LeftTimeFormatTests(unittest.TestCase):
         self.assertIn("模型 deepseek-v4.1-flash 冷却", reason)
         self.assertIn("剩余 1m30s", reason)
         self.assertIn("连续第 2 次", reason)
+
+
+class TLSVerifyTests(unittest.TestCase):
+    """A bad certificate chain is a configuration error, not a transient fault."""
+
+    def test_error_shape_is_recognised_through_urlerror(self):
+        exc = ssl.SSLCertVerificationError(
+            1, "certificate verify failed: self-signed certificate in certificate chain")
+        self.assertTrue(A.is_tls_verify_error(exc))
+        wrapped = urllib.error.URLError(exc)
+        self.assertTrue(A.is_tls_verify_error(wrapped))
+        self.assertFalse(A._retryable(wrapped),
+                         "证书错误重试三次只会把同一个失败放大")
+
+    def test_http_json_does_not_retry_a_certificate_error(self):
+        calls = []
+
+        def fake_urlopen(req, timeout=30, proxy=""):
+            calls.append(1)
+            raise urllib.error.URLError(ssl.SSLCertVerificationError(
+                1, "certificate verify failed: self-signed certificate in certificate chain"))
+
+        old = A.urlopen
+        A.urlopen = fake_urlopen
+        try:
+            with self.assertRaises(A.TLSVerifyError) as ctx:
+                A.http_json("https://example.invalid/v2/plugin/auth/state",
+                            data=b"{}", retries=3)
+        finally:
+            A.urlopen = old
+        self.assertEqual(len(calls), 1, "证书错误应当一次就停")
+        self.assertIn("WB_CA_BUNDLE", str(ctx.exception))
+
+    def test_open_upstream_stops_without_charging_the_account(self):
+        acc = account()
+        old_pool, old_urlopen = P.POOL, A.urlopen
+        P.POOL = _FakePool(acc)
+
+        def fake_urlopen(req, timeout=30, proxy=""):
+            raise urllib.error.URLError(ssl.SSLCertVerificationError(
+                1, "certificate verify failed: self-signed certificate in certificate chain"))
+
+        A.urlopen = fake_urlopen
+        try:
+            with self.assertRaises(A.TLSVerifyError) as ctx:
+                P.open_upstream({"model": "deepseek-v4.1-flash",
+                                 "messages": [{"role": "user", "content": "hi"}]},
+                                target_realm="intl")
+        finally:
+            P.POOL, A.urlopen = old_pool, old_urlopen
+        self.assertIn("WB_CA_BUNDLE", str(ctx.exception))
+        self.assertEqual(acc.fails, 0)
+        self.assertEqual(acc.cooldown_until, 0.0)
+
+
+class RefreshOn401Tests(unittest.TestCase):
+    """401 先刷新一次 token 再换号；刷新成功的同一个号要优先重试。"""
+
+    def setUp(self):
+        self.account = account()
+        self.pool = _FakePool(self.account)
+        self.old_pool, self.old_urlopen = P.POOL, A.urlopen
+        P.POOL = self.pool
+        self.calls = 0
+        self.refreshes = 0
+
+        def refresh():
+            self.refreshes += 1
+            return True
+
+        self.account.refresh = refresh
+
+    def tearDown(self):
+        P.POOL, A.urlopen = self.old_pool, self.old_urlopen
+
+    def _run(self, urlopen):
+        A.urlopen = urlopen
+        with mock.patch.object(P, "_apply_stream_idle_timeout", lambda *a: None), \
+                mock.patch.object(P.time, "sleep", lambda *_: None):
+            return P.open_upstream(
+                {"model": "deepseek-v4.1-flash",
+                 "messages": [{"role": "user", "content": "hi"}]},
+                target_realm="intl")
+
+    def test_401_refreshes_and_retries_the_same_account(self):
+        class Resp(object):
+            def close(self):
+                pass
+
+        def fake_urlopen(req, timeout=30, proxy=""):
+            self.calls += 1
+            if self.calls == 1:
+                raise urllib.error.HTTPError(
+                    req.full_url, 401, "Unauthorized", {}, None)
+            return Resp()
+
+        resp, acc, _ = self._run(fake_urlopen)
+        self.assertEqual(self.calls, 2)
+        self.assertEqual(self.refreshes, 1)
+        self.assertIs(acc, self.account)
+        self.assertIsInstance(resp, Resp)
+
+    def test_401_after_refresh_does_not_refresh_in_a_loop(self):
+        def fake_urlopen(req, timeout=30, proxy=""):
+            self.calls += 1
+            raise urllib.error.HTTPError(
+                req.full_url, 401, "Unauthorized", {}, None)
+
+        with self.assertRaises(urllib.error.HTTPError):
+            self._run(fake_urlopen)
+        self.assertEqual(self.calls, 2, "刷新后只重试一次，第二次 401 就换号/收尾")
+        self.assertEqual(self.refreshes, 1)
 
 
 class _FakePool(object):

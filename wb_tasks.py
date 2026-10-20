@@ -15,7 +15,8 @@ import urllib.request
 import wb_accounts as _accounts
 import wb_identity
 
-CHAT_BASE = "https://copilot.tencent.com"
+# 默认 https://copilot.tencent.com；WB_CN_CHAT_UPSTREAM 可覆盖（见 wb_identity.CN_CHAT_BASE）。
+CHAT_BASE = wb_identity.CN_CHAT_BASE
 BILL_BASE = "https://www.codebuddy.cn"
 WEB_BASE = "https://www.workbuddy.cn"
 #: 本模块只跑国内版，桌面端 UA 与 wb_identity 同一来源，避免两处各写一份
@@ -525,7 +526,7 @@ def do_cat_travel(account):
     return {"ok": True, "action": state, "msg": f"当前状态: {state}"}
 
 
-def _progress_one(account, t, logs, gap):
+def _progress_one(account, t, logs, gap, claim=True):
     """推进单个任务并返回本次到账积分。
 
     auto 类任务不需要接取（上游 "task does not require acceptance"），事件可
@@ -549,6 +550,9 @@ def _progress_one(account, t, logs, gap):
     # (例如用户自己在桌面端用了一次, 或夜里调度器点亮了), 这类任务必须
     # 先结算, 不能因为"只能靠真实操作"就直接跳过丢掉奖励。
     if status == "completed" or cur >= tgt:
+        if not claim:
+            logs.append(f"⏸ 任务 [{spec['name']}] 已达成，等待手动领取")
+            return 0
         res = claim_task(account, code)
         if res.get("ok"):
             cr = res.get("credit", 0)
@@ -623,6 +627,10 @@ def _progress_one(account, t, logs, gap):
         return 0
 
     # 领奖
+    if not claim:
+        logs.append(f"⏸ 任务 [{spec['name']}] 已点亮，等待手动领取")
+        time.sleep(gap)
+        return 0
     res = claim_task(account, code)
     if res.get("ok"):
         cr = res.get("credit", 0)
@@ -634,8 +642,11 @@ def _progress_one(account, t, logs, gap):
     return 0
 
 
-def run_growth_tasks(account, gap=1.0):
-    """完整执行批量成长任务点亮与领奖。"""
+def run_growth_tasks(account, gap=1.0, claim=True):
+    """完整执行批量成长任务点亮与领奖。
+
+    claim=False 只推进进度、不领奖，让用户自己挑时间领取（#507）。
+    """
     if account.realm != "cn":
         return {"ok": False, "msg": "国际版不适用国内成长任务中心", "logs": []}
     if getattr(account, "is_enterprise", lambda: False)():
@@ -655,7 +666,7 @@ def run_growth_tasks(account, gap=1.0):
     #    否则 single 任务接取会报 "prerequisite not met: first_buddy"。
     for t in tasks:
         if t.get("task_type") == "auto":
-            total_earned += _progress_one(account, t, logs, gap)
+            total_earned += _progress_one(account, t, logs, gap, claim=claim)
 
     # 1. 批量接取未接任务（auto 类不接受接取，unforgeable 无法自动化）
     def _needs_accept(x):
@@ -697,7 +708,7 @@ def run_growth_tasks(account, gap=1.0):
     for t in tasks:
         if t.get("task_type") == "auto":
             continue
-        total_earned += _progress_one(account, t, logs, gap)
+        total_earned += _progress_one(account, t, logs, gap, claim=claim)
 
     # 3. 顺手检查猫猫旅行
     tr_res = do_cat_travel(account)

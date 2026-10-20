@@ -9,9 +9,11 @@
 
 用法:
     python console_tail.py --port 8788 [--host 127.0.0.1] [--token <panel-token>]
+                             [--password <panel-password>]
 
     --token 由面板按钮场景传入（服务端内置 token，即使面板密码改过也有效）；
-    未给 token 时自用默认密码 admin 登录。任一种 token 失效都会自动重新登录。
+    未给 token 时用 --password / WB_PANEL_PASSWORD / 默认密码 admin 登录。
+    任一种 token 失效都会自动重新登录。
 """
 import os
 import sys
@@ -23,6 +25,7 @@ import urllib.error
 HOST = "127.0.0.1"
 PORT = 8788
 TOKEN = ""
+PASSWORD = os.environ.get("WB_PANEL_PASSWORD") or "admin"
 REFRESH = 1.0
 # 启动脚本会先拉起服务再开本查看器：服务就绪前的连接失败静默等待，
 # 超过该时长仍连不上才退出。
@@ -60,7 +63,7 @@ def _ensure_console_output():
 
 
 def parse_args(argv):
-    global HOST, PORT, TOKEN
+    global HOST, PORT, TOKEN, PASSWORD
     i = 1
     while i < len(argv):
         a = argv[i]
@@ -76,6 +79,9 @@ def parse_args(argv):
         elif a == "--token" and i + 1 < len(argv):
             TOKEN = argv[i + 1]
             i += 2
+        elif a == "--password" and i + 1 < len(argv):
+            PASSWORD = argv[i + 1]
+            i += 2
         else:
             i += 1
 
@@ -86,7 +92,7 @@ def _url(path):
 
 def login():
     global TOKEN
-    data = json.dumps({"password": "admin"}).encode("utf-8")
+    data = json.dumps({"password": PASSWORD}).encode("utf-8")
     req = urllib.request.Request(
         _url("/panel/login"),
         data=data,
@@ -121,6 +127,11 @@ def fmt(entry):
 
 def main():
     _ensure_console_output()
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     parse_args(sys.argv)
     print("=" * 60, flush=True)
     print("  WorkBuddy proxy - live console (port %d)" % PORT)
@@ -132,7 +143,8 @@ def main():
             login()
             print("[viewer] logged in")
         except Exception:
-            print("[viewer] 等待面板登录（默认密码 admin）...")
+            print("[viewer] 等待面板登录（密码取自 --password / "
+                  "WB_PANEL_PASSWORD，默认 admin）...")
     since = 0
     fail_streak = 0
     ever_ok = False
@@ -168,8 +180,9 @@ def main():
                 if TOKEN:
                     print("[viewer] 无法连接服务（30 秒无响应），查看器退出。")
                 else:
-                    print("[viewer] 面板登录失败：请确认面板密码，或从面板"
-                          "「眼睛」按钮打开查看器。")
+                    print("[viewer] 面板登录失败：如果改过面板密码，请用"
+                          " --password <密码> 或环境变量 WB_PANEL_PASSWORD 重开；"
+                          "也可以直接从面板「运行日志」页查看。")
                 time.sleep(2)
                 return
             # 服务尚未就绪：静默等待，不打印错误。
