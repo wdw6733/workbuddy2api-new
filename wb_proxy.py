@@ -21176,28 +21176,44 @@ class Handler(BaseHTTPRequestHandler):
     def _station_open(self, payload, candidates, model, t_start):
         """按候选顺序打开站点；连接失败 / 5xx / 429 自动切换下一站（故障转移）。
 
-        返回 (resp, st_id, real_model)。4xx（参数/密钥问题，换站无用）或全部
-        候选耗尽时，已回错误响应并返回 (None, None, None)。
+        返回 (resp, st_id, real_model)。全部候选耗尽时已回错误响应并返回
+        (None, None, None)。
         """
         last_exc = None
+        last_detail = ""
         tried = []
         for st_id, real_model in candidates:
             try:
                 resp = wb_stations.open_chat(st_id, real_model, payload)
                 return (resp, st_id, real_model)
             except urllib.error.HTTPError as exc:
-                if exc.code in (429, 500, 502, 503, 504):
-                    wb_stations.mark_failed(st_id)
-                    last_exc = exc
-                    tried.append("%s(HTTP %d)" % (st_id, exc.code))
-                    log("station-failover: model=%s station=%s HTTP %d -> 切换下一站"
-                        % (model, st_id, exc.code))
-                    continue
                 detail = ""
                 try:
                     detail = exc.read(600).decode("utf-8", "replace")
                 except Exception:
                     pass
+                # 哪些状态码该换下一站？
+                #   429/5xx       站点过载或自身故障
+                #   401/403       该站的 Key 失效、或这个 Key 无权用该模型
+                #   404           该站其实没有这个模型（清单过时）
+                # 三者都是「这一站不行」，换站往往就能成——同名模型多站共享
+                # 时尤其明显：旧逻辑对 401/403 直接回错，第一站 Key 失效就把
+                # 整条链路打死，后面的好站根本没机会。
+                # 只有 400/422 是请求本身的问题，换站也一样错，直接回。
+                if exc.code in (401, 403, 404, 408, 429, 500, 502, 503, 504):
+                    wb_stations.mark_failed(st_id)
+                    last_exc = exc
+                    last_detail = detail
+                    # 每一站的响应摘要都留在错误文案里：多站共享时用户最需要
+                    # 知道「哪一站、因为什么」失败（例如某站 Key 失效返回
+                    # 「无效的令牌」），而不是只知道最后那一站。
+                    brief = detail[:60].replace("\n", " ").strip()
+                    tried.append("%s(HTTP %d%s)" % (
+                        st_id, exc.code, ("：" + brief) if brief else ""))
+                    log("station-failover: model=%s station=%s HTTP %d -> 切换下一站%s"
+                        % (model, st_id, exc.code,
+                           ("｜" + detail[:120].replace("\n", " ")) if detail else ""))
+                    continue
                 record_error(model, exc.code, "station HTTP %d: %s" % (exc.code, detail[:200]),
                              elapsed_ms=int((time.time() - t_start) * 1000),
                              key=self._key_id())
@@ -21215,6 +21231,8 @@ class Handler(BaseHTTPRequestHandler):
             message = "无可用公益站"
         else:
             message = "公益站全部不可用（已尝试 %s）: %s" % (" → ".join(tried), last_exc)
+            if last_detail:
+                message += "｜最后一站响应: " + last_detail[:200].replace("\n", " ")
         record_error(model, 502, message,
                      elapsed_ms=int((time.time() - t_start) * 1000),
                      key=self._key_id())

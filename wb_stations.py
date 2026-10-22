@@ -574,8 +574,18 @@ def _station_latency(st_id):
 
 
 def _station_sort_key(item):
+    """候选站点排序：先按「是否已知异常」，再按优先级，最后按延迟。
+
+    已知异常（不可用 / 无模型 / Key 失效）的站点只在正常站全挂时当兜底，
+    不能因为它的探测延迟小就排到前面——否则同名模型多站共享时，每次请求
+    都先撞一遍坏站，白等一轮超时才切到好站。
+    """
     st_id, _mid = item
-    return (_station_priority(st_id), _station_latency(st_id))
+    st = _find(st_id) or {}
+    state = (st.get("status") or {}).get("state")
+    # 未测活（None / unknown）与正常（ok）同级：没证据就别当坏站。
+    bad = 0 if state in (None, "", "ok", "unknown") else 1
+    return (bad, _station_priority(st_id), _station_latency(st_id))
 
 
 def _is_cooling(st_id):
