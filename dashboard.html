@@ -4434,6 +4434,18 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       </div>
     </section>
   </div>
+  <div class="modal-mask" id="clientDetectModal" onclick="if(event.target===this) closeClientDetect()">
+    <div class="modal" role="dialog" aria-modal="true" style="width:min(560px,100%)">
+      <div class="modal-hd">
+        <h2 id="clientDetectTitle">检测客户端</h2>
+        <button class="modal-x" onclick="closeClientDetect()" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-bd" id="clientDetectBody"></div>
+      <div class="modal-ft">
+        <button class="sec" onclick="closeClientDetect()">关闭</button>
+      </div>
+    </div>
+  </div>
 
   <div class="modal-mask" id="stationEditModal" onclick="if(event.target===this) closeStationEdit()">
     <div class="modal" role="dialog" aria-modal="true" style="width:min(560px,100%)">
@@ -4452,6 +4464,16 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         <input id="stationEditKey" class="slot-input" style="margin-bottom:12px" placeholder="sk-...（编辑时留空则保留原值）">
         <div style="font-size:12px;color:var(--dim);margin-bottom:4px">优先级（越小越优先，故障转移顺序）</div>
         <input id="stationEditPriority" type="number" class="slot-input" style="margin-bottom:12px" value="0" min="0" step="1">
+        <div style="font-size:12px;color:var(--dim);margin-bottom:4px">出站身份（伪装客户端）</div>
+        <select id="stationEditClient" class="slot-input" style="margin-bottom:6px">
+          <option value="browser">浏览器（默认，兼容性最好）</option>
+          <option value="codex">Codex CLI（AnyRouter 等要求 Codex 的站）</option>
+          <option value="claude">Claude Code CLI</option>
+          <option value="vscode">VS Code 扩展</option>
+          <option value="cli">命令行 CLI</option>
+          <option value="wb">WorkBuddy 桌面端</option>
+        </select>
+        <div class="hint" style="margin:0 0 12px">有的站只放行特定客户端（如 AnyRouter 要求 Codex）。不确定就点列表里的「检测客户端」自动试。</div>
         <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
           <input type="checkbox" id="stationEditEnabled" checked style="margin:0"> 启用该站点
         </label>
@@ -16020,8 +16042,14 @@ function renderStations(){
       ? '<a href="' + esc(siteHref) + '" target="_blank" rel="noopener noreferrer" '
         + 'style="color:var(--dim);font-size:11px;word-break:break-all;text-decoration:none">' + esc(url) + '</a>'
       : '<span style="color:var(--dim);font-size:11px;word-break:break-all">' + esc(url) + '</span>';
+    // 出站身份非默认时单独标出来：用户一眼能看出这个站在伪装成哪个客户端
+    const profile = st.client_profile || 'browser';
+    const profileLabel = (PROFILE_LABELS[profile] || '') ;
+    const profileHtml = (profile && profile !== 'browser' && profileLabel)
+      ? ' <span title="转发到该站时伪装成该客户端" style="font-weight:400;color:var(--accent,#4f8cff);font-size:11px;border:1px solid currentColor;border-radius:4px;padding:0 4px">' + esc(profileLabel) + '</span>'
+      : '';
     html += '<tr>' +
-      '<td><div>' + nameHtml +
+      '<td><div>' + nameHtml + profileHtml +
           ' <span style="font-weight:400;color:var(--dim);font-size:11px">优先级 ' + pri + '</span></div>' +
           '<div>' + urlHtml + '</div>' +
           (st.enabled ? '' : '<span style="color:var(--warn,#d97706);font-size:11px">（已停用）</span>') + '</td>' +
@@ -16033,6 +16061,8 @@ function renderStations(){
         '<a class="sec mini" href="' + esc(siteHref || '#') + '" target="_blank" rel="noopener noreferrer" '
           + 'style="text-decoration:none;display:inline-flex;align-items:center">打开站点</a>' +
         '<button class="sec mini" onclick="probeStation(\'' + st.id + '\')">测活</button>' +
+        '<button class="sec mini" onclick="detectStationClient(\'' + st.id + '\')" '
+          + 'title="逐个试浏览器/Codex/Claude 等身份，找出该站放行的那一个">检测客户端</button>' +
         '<button class="sec mini" onclick="openStationModels(\'' + st.id + '\')">选模型</button>' +
         '<button class="sec mini" onclick="fetchStationBalance(\'' + st.id + '\')">余额</button>' +
         '<button class="sec mini" onclick="openStationEdit(\'' + st.id + '\')">编辑</button>' +
@@ -16067,6 +16097,78 @@ function stationById(id){
   return null;
 }
 
+// 出站身份显示名（与后端 wb_stations._CLIENT_PROFILES 一一对应）
+const PROFILE_LABELS = {
+  browser: '浏览器',
+  codex: 'Codex',
+  claude: 'Claude Code',
+  vscode: 'VS Code',
+  cli: 'CLI',
+  wb: 'WorkBuddy'
+};
+
+function closeClientDetect(){
+  document.getElementById('clientDetectModal').classList.remove('show');
+}
+
+function _clientDetectRow(profile, status, ok, detail){
+  const label = PROFILE_LABELS[profile] || profile;
+  const mark = ok
+    ? '<span style="color:var(--ok,#16a34a);font-weight:600">可用</span>'
+    : '<span style="color:var(--bad,#dc2626)">不可用</span>';
+  const code = status ? ('HTTP ' + status) : '连接失败';
+  return '<tr><td style="padding:6px 8px;font-weight:600">' + esc(label) + '</td>'
+    + '<td style="padding:6px 8px">' + mark + '</td>'
+    + '<td style="padding:6px 8px;color:var(--dim);font-size:11px">' + esc(code)
+    + (detail ? '｜' + esc(String(detail).slice(0, 90)) : '') + '</td></tr>';
+}
+
+async function detectStationClient(id){
+  const st = stationById(id);
+  const name = st ? st.name : '该站点';
+  const body = document.getElementById('clientDetectBody');
+  document.getElementById('clientDetectTitle').textContent = '检测客户端：' + name;
+  body.innerHTML = '<div style="color:var(--dim);font-size:13px">正在逐个身份试一次极短请求'
+    + '（每种约 1 token），最多试 5 种，请稍候…</div>';
+  document.getElementById('clientDetectModal').classList.add('show');
+  try {
+    const r = await postJSON('/stations/detect-client', { id: id, save: true });
+    let html = '';
+    if(r && r.ok){
+      const label = PROFILE_LABELS[r.profile] || r.profile;
+      html += '<div style="margin-bottom:10px;font-size:13px;color:var(--ok,#16a34a)">'
+        + '该站接受「' + esc(label) + '」，已自动写回该站点的出站身份。</div>';
+      if(r.model){
+        html += '<div style="margin-bottom:10px;color:var(--dim);font-size:11px">'
+          + '测试模型：' + esc(r.model) + '</div>';
+      }
+      await loadStations();
+    } else {
+      html += '<div style="margin-bottom:10px;font-size:13px;color:var(--bad,#dc2626)">'
+        + '所有身份都没通' + (r && r.error ? '：' + esc(r.error) : '') + '</div>';
+      if(r && r.tried && r.tried.length){
+        html += '<div style="margin-bottom:10px;color:var(--dim);font-size:11px">'
+          + '如果每个都返回 401/403 且提示 Key 无效，问题在站点 Key 而不是客户端身份。</div>';
+      }
+    }
+    const tried = (r && r.tried) || [];
+    if(tried.length){
+      html += '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+        + '<thead><tr style="color:var(--dim);text-align:left">'
+        + '<th style="padding:4px 8px">身份</th><th style="padding:4px 8px">结果</th>'
+        + '<th style="padding:4px 8px">说明</th></tr></thead><tbody>';
+      tried.forEach(function(t){
+        html += _clientDetectRow(t.profile, t.status, t.ok, t.detail);
+      });
+      html += '</tbody></table>';
+    }
+    body.innerHTML = html;
+  } catch(e){
+    body.innerHTML = '<div style="color:var(--bad,#dc2626);font-size:13px">检测失败：'
+      + esc(e.message || String(e)) + '</div>';
+  }
+}
+
 function openStationEdit(id){
   const st = id ? stationById(id) : null;
   document.getElementById('stationEditId').value = id || '';
@@ -16075,6 +16177,7 @@ function openStationEdit(id){
   document.getElementById('stationEditUrl').value = st ? (st.base_url || '') : '';
   document.getElementById('stationEditKey').value = '';
   document.getElementById('stationEditPriority').value = st ? (st.priority != null ? st.priority : 0) : 0;
+  document.getElementById('stationEditClient').value = (st && st.client_profile) || 'browser';
   document.getElementById('stationEditEnabled').checked = st ? !!st.enabled : true;
   document.getElementById('stationEditModal').classList.add('show');
 }
@@ -16088,10 +16191,12 @@ async function saveStation(){
   const url = document.getElementById('stationEditUrl').value.trim();
   const key = document.getElementById('stationEditKey').value.trim();
   const priority = parseInt(document.getElementById('stationEditPriority').value, 10);
+  const clientProfile = document.getElementById('stationEditClient').value;
   const enabled = document.getElementById('stationEditEnabled').checked;
   if(!name || !url){ toast('站点名称和接口地址不能为空', 'bad'); return; }
   try {
-    const body = { id: id, name: name, base_url: url, enabled: enabled };
+    const body = { id: id, name: name, base_url: url, enabled: enabled,
+                   client_profile: clientProfile };
     if(key) body.api_key = key;
     if(!isNaN(priority)) body.priority = priority;
     await postJSON('/stations/save', body);

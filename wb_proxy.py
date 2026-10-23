@@ -17861,7 +17861,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_stations(self, path, payload):
         """面板公益站管理写接口：/stations/save | /stations/delete |
-        /stations/probe | /stations/models | /stations/balance。"""
+        /stations/probe | /stations/models | /stations/balance |
+        /stations/detect-client。"""
         if path == "/stations/save":
             st_id = str(payload.get("id") or "").strip()
             name = str(payload.get("name") or "").strip()
@@ -17880,6 +17881,7 @@ class Handler(BaseHTTPRequestHandler):
             if enabled is not None:
                 enabled = bool(enabled)
             priority = payload.get("priority")
+            client_profile = payload.get("client_profile")
             if not name or not base_url:
                 return self._error(400, "name and base_url are required",
                                    "invalid_request_error")
@@ -17895,12 +17897,14 @@ class Handler(BaseHTTPRequestHandler):
                     login_password=login_password,
                     session_cookie=session_cookie,
                     oauth_provider=oauth_provider,
-                    idp_cookie=idp_cookie)
+                    idp_cookie=idp_cookie,
+                    client_profile=client_profile)
                 if not st:
                     return self._error(404, "station not found", "invalid_request_error")
             else:
                 st = wb_stations.add_station(name, base_url, api_key, enabled=enabled,
-                                             priority=priority, checkin_url=checkin_url)
+                                             priority=priority, checkin_url=checkin_url,
+                                             client_profile=client_profile or "browser")
                 if checkin_method:
                     st = wb_stations.update_station(
                         st["id"], checkin_method=checkin_method,
@@ -17936,6 +17940,19 @@ class Handler(BaseHTTPRequestHandler):
             if not st:
                 return self._error(404, "station not found", "invalid_request_error")
             return self._json(200, {"ok": True, "station": st})
+        if path == "/stations/detect-client":
+            # 出站身份自动检测：有些站只放行特定客户端（AnyRouter 要 Codex）。
+            # 逐个身份发一次 max_tokens=1 的 chat，第一个通的就是可用身份；
+            # save=True 时顺手写回站点配置。
+            st_id = str(payload.get("id") or "").strip()
+            if not st_id:
+                return self._error(400, "id is required", "invalid_request_error")
+            result = wb_stations.detect_client_profile(st_id)
+            if not result.get("ok"):
+                return self._json(200, result)
+            if payload.get("save"):
+                wb_stations.update_station(st_id, client_profile=result["profile"])
+            return self._json(200, result)
         if path == "/stations/balance":
             st_id = str(payload.get("id") or "").strip()
             if st_id:
@@ -21185,6 +21202,9 @@ class Handler(BaseHTTPRequestHandler):
         for st_id, real_model in candidates:
             try:
                 resp = wb_stations.open_chat(st_id, real_model, payload)
+                # 这一站通了，说明它现在是好的：把之前失败留下的冷却清掉，
+                # 否则后续请求还会因为它「正在冷却」被排到候选末尾。
+                wb_stations.clear_cooling(st_id)
                 return (resp, st_id, real_model)
             except urllib.error.HTTPError as exc:
                 detail = ""

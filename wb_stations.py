@@ -21,6 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import http.cookiejar
 
 try:  # 模型上下文/输出上限的四级查找（上游值 > 内建表 > model.json > models.dev）
@@ -141,7 +142,7 @@ def _station_default_status():
 
 
 def add_station(name, base_url, api_key, enabled=True, priority=0, checkin_url="",
-                login_username="", login_password=""):
+                login_username="", login_password="", client_profile="browser"):
     """新增站点；返回站点 dict。base_url 建议 .../v1 结尾（也兼容根地址）。"""
     try:
         priority = int(priority)
@@ -165,6 +166,9 @@ def add_station(name, base_url, api_key, enabled=True, priority=0, checkin_url="
         "oauth_provider": "",
         "idp_cookie": "",
         "priority": priority,
+        # 出站身份：有些站只放行特定客户端（AnyRouter 要 Codex CLI）。
+        # 默认 browser 与改造前完全一致，老站点行为不变。
+        "client_profile": _normalize_client(client_profile),
         "models_selected": [],
         "models_all": [],
         "models_meta": {},
@@ -182,7 +186,7 @@ def update_station(st_id, name=None, base_url=None, api_key=None, enabled=None,
                    checkin_url=None, priority=None, checkin_method=None,
                    checkin_token=None, checkin_user_id=None,
                    login_username=None, login_password=None, session_cookie=None,
-                   oauth_provider=None, idp_cookie=None):
+                   oauth_provider=None, idp_cookie=None, client_profile=None):
     """更新站点；api_key 传 None 或空串表示保留原值。返回更新后的站点或 None。"""
     with _LOCK:
         st = _find(st_id)
@@ -224,6 +228,8 @@ def update_station(st_id, name=None, base_url=None, api_key=None, enabled=None,
             st["oauth_provider"] = p if p in ("linuxdo", "github") else ""
         if idp_cookie is not None:
             st["idp_cookie"] = str(idp_cookie).strip()
+        if client_profile is not None:
+            st["client_profile"] = _normalize_client(client_profile)
         # 地址或密钥变了，旧测活结果不再可信
         st["status"] = _station_default_status()
         st["models_all"] = []
@@ -290,9 +296,72 @@ def _chat_url(st):
     return base + "/v1/chat/completions"
 
 
+# ---- 出站身份（客户端伪装） ------------------------------------------
+#
+# 有些公益站只放行特定客户端：AnyRouter 要求 Codex CLI，另一些要求
+# Claude Code / VS Code 扩展。它们通常只看 User-Agent 和几个特征头，
+# 所以按身份切换请求头就能通。默认 browser 保持原行为（浏览器 UA），
+# 老站点不受影响。
+#
+# 新增身份时只要往这张表里加一条：profile -> 固定头，动态头（session_id
+# 之类）在 _client_headers 里补。
+
+_CLIENT_PROFILES = ("browser", "codex", "claude", "vscode", "cli", "wb")
+
+_CLIENT_HEADERS = {
+    "browser": {},  # 浏览器 UA 由 _auth_headers 兜底
+    "codex": {
+        "User-Agent": "codex_cli_rs/0.48.0 (Windows 11; x86_64) WindowsTerminal",
+        "originator": "codex_cli_rs",
+        "OpenAI-Beta": "responses=experimental",
+        "Accept": "application/json",
+    },
+    "claude": {
+        "User-Agent": "claude-cli/2.0.14 (external, cli)",
+        "anthropic-version": "2023-06-01",
+        "x-app": "cli",
+        "Accept": "application/json",
+    },
+    "vscode": {
+        "User-Agent": "vscode/1.105.0 CodeBuddy/5.8.4",
+        "x-app": "vscode",
+        "Accept": "application/json",
+    },
+    "cli": {
+        "User-Agent": "CLI/2.161.0 CodeBuddy/5.8.4",
+        "x-app": "cli",
+        "Accept": "application/json",
+    },
+    "wb": {
+        "User-Agent": "WorkBuddy/5.8.4 workbuddy-ai/5.8.4",
+        "Accept": "application/json",
+    },
+}
+
+#: 「检测客户端」按这个顺序试：先默认（不改变现有行为），再按常见程度。
+_CLIENT_PROBE_ORDER = ("browser", "codex", "claude", "vscode", "cli")
+
+
+def _normalize_client(value):
+    v = str(value or "").strip().lower()
+    return v if v in _CLIENT_PROFILES else "browser"
+
+
+def _client_headers(profile):
+    """按出站身份返回请求头；未知身份退回浏览器 UA（原行为）。"""
+    profile = _normalize_client(profile)
+    h = {"User-Agent": _BROWSER_UA, "Accept": "application/json"}
+    h.update(_CLIENT_HEADERS.get(profile) or {})
+    if profile == "codex":
+        # Codex CLI 每轮带 session_id；不带也能过多数站，带上更真。
+        h["session_id"] = uuid.uuid4().hex
+    return h
+
+
 def _auth_headers(st):
-    h = {"Content-Type": "application/json", "User-Agent": _BROWSER_UA,
+    h = {"Content-Type": "application/json",
          "Accept-Encoding": "identity"}
+    h.update(_client_headers(st.get("client_profile")))
     key = st.get("api_key") or ""
     if key:
         h["Authorization"] = "Bearer " + key
@@ -612,8 +681,17 @@ def clear_cooling(st_id=None):
 def resolve(model):
     """把模型名解析成候选站点列表 [(站点 id, 真实模型名), ...]。
 
-    已按「优先级升序 + 最近测活延迟升序」排序，并排除冷却中的站点。
-    返回空列表表示未命中（或无可用站点）。
+    已按「优先级升序 + 最近测活延迟升序」排序。冷却中的站点优先让位给
+    正常站点；**全部候选都在冷却时仍然返回它们**——冷却只是「先别选我」，
+    不是「这个模型没站可用」。
+
+    最后这点很关键：早先版本把冷却站点直接过滤掉，于是「单站点 + 刚失败
+    过一次」的模型会返回空列表，请求就被当成普通模型落到 WorkBuddy 账号
+    池，用户看到的是 `no usable account for realm 'intl'` 这种完全不相干
+    的报错。返回冷却候选后，请求会真的去重试站点，失败时也能给出站点侧
+    的真实原因。
+
+    返回空列表只表示「路由表里没有这个模型」。
     """
     if not model or not isinstance(model, str):
         return []
@@ -623,8 +701,12 @@ def resolve(model):
         if not cands:
             return []
         alive = [(s, m) for (s, m) in cands if not _is_cooling(s)]
-        alive.sort(key=_station_sort_key)
-        return alive
+        if alive:
+            alive.sort(key=_station_sort_key)
+            return alive
+        fallback = list(cands)
+        fallback.sort(key=_station_sort_key)
+        return fallback
 
 
 def _accounts_dir():
@@ -856,6 +938,8 @@ def view():
                     note += "｜余额 " + str(bal["display"])
             item["note"] = note
             item["models_meta"] = st.get("models_meta") or {}
+            # 老数据没有 client_profile：按 browser 兜底，面板下拉才有值可选
+            item["client_profile"] = _normalize_client(st.get("client_profile"))
             # 站点登录与签到相关字段不再对外暴露：面板已改为「点开站点手动签到」
             for _k in ("checkin_url", "checkin_method", "checkin_token", "checkin_user_id",
                        "login_username", "login_password", "session_cookie", "idp_cookie",
@@ -889,6 +973,66 @@ def open_chat(st_id, real_model, payload):
 # ---- 余额查询（New API / One API 兼容） ------------------------------
 
 BALANCE_TIMEOUT = 8
+
+#: 「检测客户端」每次试身份的超时：站点多、身份多，不能拖太久。
+CLIENT_PROBE_TIMEOUT = 20
+
+
+def detect_client_profile(st_id):
+    """探测站点放行哪种客户端身份（出站身份）。
+
+    有些公益站只认特定客户端：AnyRouter 要求 Codex CLI，另一些要求
+    Claude Code / VS Code 扩展。做法是用一次最小 chat 请求
+    （max_tokens=1）按 _CLIENT_PROBE_ORDER 依次试，第一个 HTTP 200 且
+    响应是 JSON 的身份就是可用身份。
+
+    成本：最多 5 次极短请求（每次 1 token），只在用户点「检测客户端」时跑。
+    返回 {"ok": bool, "profile": str, "model": str, "tried": [...]}。
+    """
+    with _LOCK:
+        st = _find(st_id)
+        snap = json.loads(json.dumps(st)) if st else None
+    if not snap:
+        return {"ok": False, "error": "站点不存在", "profile": "", "tried": []}
+    models = list(snap.get("models_selected") or []) or list(snap.get("models_all") or [])
+    model = models[0] if models else ""
+    if not model:
+        return {"ok": False, "error": "站点还没有模型清单：请先测活，再勾选至少一个模型",
+                "profile": "", "tried": []}
+    tried = []
+    for profile in _CLIENT_PROBE_ORDER:
+        trial = dict(snap)
+        trial["client_profile"] = profile
+        body = json.dumps({"model": model,
+                           "messages": [{"role": "user", "content": "hi"}],
+                           "max_tokens": 1, "stream": False}).encode("utf-8")
+        req = urllib.request.Request(_chat_url(trial), data=body,
+                                     headers=_auth_headers(trial), method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=CLIENT_PROBE_TIMEOUT) as resp:
+                raw = _read_body(resp, 64 * 1024)
+                status = getattr(resp, "status", 200)
+            try:
+                json.loads(raw)
+                parsed = True
+            except Exception:
+                parsed = False
+            tried.append({"profile": profile, "status": status, "ok": parsed,
+                          "detail": "" if parsed else "响应不是 JSON"})
+            if parsed:
+                return {"ok": True, "profile": profile, "model": model, "tried": tried}
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read(300).decode("utf-8", "replace")
+            except Exception:
+                pass
+            tried.append({"profile": profile, "status": exc.code, "ok": False,
+                          "detail": detail[:200]})
+        except Exception as exc:
+            tried.append({"profile": profile, "status": 0, "ok": False,
+                          "detail": str(exc)[:160]})
+    return {"ok": False, "profile": "", "model": model, "tried": tried}
 
 
 def _root_url(st):

@@ -181,5 +181,59 @@ class CandidateOrderTests(unittest.TestCase):
         self.assertEqual([sid for sid, _m in route], [unprobed, healthy])
 
 
+class CoolingTests(unittest.TestCase):
+    """冷却语义：只是「先别选我」，不是「这个模型没站可用」。
+
+    回归点：早先版本把冷却站点从候选里过滤掉，导致「单站点刚失败一次」
+    时 resolve() 返回空列表，请求被当成普通模型落到 WorkBuddy 账号池，
+    用户看到 `no usable account for realm 'intl'` 这种完全不相干的报错。
+    """
+
+    def setUp(self):
+        wb_stations._STATIONS = []
+        wb_stations._ROUTE_TABLE = {}
+        wb_stations._COOLING.clear()
+
+    def tearDown(self):
+        wb_stations._COOLING.clear()
+
+    def _add(self, name, state="ok", latency=100):
+        st = wb_stations.add_station(name, "https://%s.example.com/v1" % name, "sk-x")
+        with wb_stations._LOCK:
+            row = wb_stations._find(st["id"])
+            row["status"] = {"state": state, "latency_ms": latency}
+            row["models_selected"] = ["gpt-6.1-sol"]
+        wb_stations._rebuild_routes()
+        return st["id"]
+
+    def test_cooling_station_yields_to_healthy_peer(self):
+        cooling = self._add("cooling")
+        healthy = self._add("healthy")
+        wb_stations.mark_failed(cooling)
+        route = wb_stations.resolve("gpt-6.1-sol")
+        self.assertEqual([sid for sid, _m in route], [healthy])
+
+    def test_all_stations_cooling_still_returns_candidates(self):
+        """唯一候选在冷却中，也必须返回它——否则请求会静默落到账号池。"""
+        only = self._add("only")
+        wb_stations.mark_failed(only)
+        route = wb_stations.resolve("gpt-6.1-sol")
+        self.assertEqual([sid for sid, _m in route], [only])
+
+    def test_unknown_model_still_resolves_to_nothing(self):
+        self._add("only")
+        self.assertEqual(wb_stations.resolve("not-a-station-model"), [])
+
+    def test_clear_cooling_restores_normal_order(self):
+        first = self._add("first", latency=50)
+        second = self._add("second", latency=500)
+        wb_stations.mark_failed(first)
+        self.assertEqual([sid for sid, _m in wb_stations.resolve("gpt-6.1-sol")], [second])
+        wb_stations.clear_cooling(first)
+        self.assertEqual([sid for sid, _m in wb_stations.resolve("gpt-6.1-sol")],
+                         [first, second])
+
+
+
 if __name__ == "__main__":
     unittest.main()
