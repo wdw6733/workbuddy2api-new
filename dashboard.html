@@ -4557,6 +4557,10 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         取消勾选就把该页签从顶部收起来，勾回来即恢复；清单按顶部现有的页签现场生成，上游增删页面这里自动跟上；偏好存在本网关，换浏览器、重启服务都记得。「设置」是这一页自己的入口，固定保留。
       </div>
       <div id="setPagesList" style="display:flex;flex-wrap:wrap;gap:8px 20px"></div>
+      <div style="margin-top:12px">
+        <button class="sec mini" id="btnShowAllPages" onclick="showAllPages()"
+                title="把所有被收起的页签一次性放回顶部">全部显示</button>
+      </div>
     </section>
 
     <section>
@@ -5186,8 +5190,25 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <div style="font-size:12px;color:var(--dim);margin-top:4px">检测本机已安装的 AI 编程客户端，一键把它们的配置指向本网关；原始文件会先备份，随时可一键还原。</div>
     </div>
 
+    <!-- 远程 / 容器部署（看板不是从网关所在机器打开的）时一键配置没有落点：apply
+         改的是容器里的配置目录，到不了用户自己的电脑。上游的做法是把整个入口藏掉，
+         结果就是「刷新一瞬间有、随后消失」，用户只会以为功能没了。这里不藏入口，
+         把原因写清楚，并保留「其他客户端」里那些可以直接复制的地址。 -->
+    <div id="agentRemoteNotice" hidden
+         style="margin-bottom:20px;padding:12px 14px;border:1px solid var(--warn,#d97706);border-radius:14px;background:var(--panel2);font-size:12.5px;line-height:1.7;color:var(--fg)">
+      <div style="font-weight:600;margin-bottom:6px">一键配置在这里用不了（看板是远程打开的）</div>
+      <div style="color:var(--dim)">
+        看板是从另一台机器（或容器端口映射）打开的，一键配置改的是<b>网关进程所在机器</b>的配置目录，
+        到你自己的电脑上无效，所以本页只保留手动接入信息。<br>
+        想用一键配置：把网关直接跑在要配置的那台电脑上，再从
+        <span class="mono">127.0.0.1</span> 打开看板。<br>
+        手动接入：把 <span class="mono" id="agentRemoteUrl">-</span> 填进客户端的
+        Base URL / API 地址，Key 到「设置 → API Key」复制；下面「其他客户端」里的地址可以直接点复制。
+      </div>
+    </div>
+
     <!-- 左侧导航由 initPageNav() 扫描本页的 section 自动生成，增删区块无需同步改动。 -->
-    <section>
+    <section data-needs-local>
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
         <div>
           <h2 style="margin:0">连接信息 <em id="agentConnState"></em></h2>
@@ -5215,7 +5236,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <div style="font-size:12px;color:var(--dim);margin-top:10px">「全局 API Key」表示不在客户端配置里写入具体 Key，客户端沿用网关当前生效的全局 Key。</div>
     </section>
 
-    <section>
+    <section data-needs-local>
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
         <div>
           <h2 style="margin:0">本机客户端 <em id="agentDetectState"></em></h2>
@@ -10610,6 +10631,23 @@ function renderPageVisibility(){
   }
 }
 
+/* 一次把所有收起的页签放回来。页签被收起来之后，面板里除了这个开关没有别的地方
+   能把它找回来，而「哪个勾选框对应哪个页签」并不总是显而易见（尤其是升级后新增
+   的页面）——给一个一键还原，比让人对着清单猜要省事。 */
+async function showAllPages(){
+  if(!_hiddenPages.length) return;
+  const before = _hiddenPages.slice();
+  applyHiddenPages([]);
+  try {
+    const res = await postJSON('/settings/save', {hidden_pages: []});
+    if(res && Array.isArray(res.hidden_pages)) applyHiddenPages(res.hidden_pages);
+    toast('已显示全部页签', 'ok');
+  } catch(e) {
+    applyHiddenPages(before);
+    toast('页面显示设置保存失败: ' + e.message, 'bad');
+  }
+}
+
 /* 显式选择走既有的 settings save 通道（一个键的 patch，不动别的设置）。 */
 async function togglePageVisibility(key){
   const before = _hiddenPages.slice();
@@ -12874,26 +12912,54 @@ async function autoAssignSlots(){
   toast('已为 ' + unbound.length + ' 个未绑定账号分配代理出口', 'ok');
 }
 
-/* 智能体配置只在「浏览器和网关进程同一台机器」时成立（issue #246）：服务端 /
-   Docker / OpenWrt 部署下看板是远程打开的，一键配置改的是容器或路由器里的
-   配置目录，到不了用户自己的电脑。服务端据此回 enabled:false，这里把入口整个
-   撤掉；判定失败（网络抖动等）保持可见——本机用户不该因此丢掉这个入口。 */
+/* 智能体配置的「一键写入」只在「浏览器和网关进程同一台机器」时成立（issue #246）：
+   服务端 / Docker / OpenWrt 部署下看板是远程打开的，一键配置改的是容器或路由器
+   里的配置目录，到不了用户自己的电脑。服务端据此回 enabled:false。
+
+   注意这里**不再把入口藏掉**。藏掉的后果是「刷新一瞬间有、随后消失」——用户看到
+   一个页签闪一下就没了，只会以为功能坏了或者版本不对，根本无从判断这是部署形态的
+   限制。改成：入口一直在，进页面后用一条说明讲清为什么不能一键写、该怎么手动接
+   （「其他客户端」里的地址远程也能用，那才是这种部署下真正有价值的部分）。 */
 let AGENTS_AVAILABLE = true;
+let AGENTS_REMOTE_REASON = '';
+
+function renderAgentsRemoteNotice(){
+  const box = document.getElementById('agentRemoteNotice');
+  const on = !AGENTS_AVAILABLE;
+  if(box){
+    box.hidden = !on;
+    if(on){
+      const url = document.getElementById('agentRemoteUrl');
+      if(url) url.textContent = location.origin + '/v1';
+      if(AGENTS_REMOTE_REASON){
+        box.title = AGENTS_REMOTE_REASON;
+      }
+    }
+  }
+  // 「连接信息」「本机客户端」两块都是给一键写入用的，远程打开时既没有本机客户端
+  // 可检测、Key / 模型下拉也拿不到数据，留着只会是一片空白和空下拉，一并收起。
+  Array.from(document.querySelectorAll('#pageAgents [data-needs-local]')).forEach(function(el){
+    el.hidden = on;
+  });
+  // 区块显隐变了，左侧「本页导航」得跟着重建：pageNavSections() 会跳过
+  // display:none 的区块，签名一变 initPageNav() 就重新生成清单。
+  const page = document.getElementById('pageAgents');
+  if(page && page.classList.contains('active')) initPageNav(page);
+}
+
 async function loadAgentsAvailability(){
   try {
     const r = await getJSON('/agents/available');
     if(r && r.enabled === false){
       AGENTS_AVAILABLE = false;
-      const btn = document.getElementById('btnNavAgents');
-      if(btn) btn.style.display = 'none';
+      AGENTS_REMOTE_REASON = r.reason || '';
+      renderAgentsRemoteNotice();
     }
   } catch(e){}
 }
 
 function switchMainTab(tab){
-  // 入口被撤掉后（?tab=agents 的书签、上次停留的页签）退回网关页
-  if(tab === 'agents' && !AGENTS_AVAILABLE) tab = 'gateway';
-  // 被「顶部页签显示」收起来的页面同理：书签与上次停留的页签都不能把内容调出来，
+  // 被「顶部页签显示」收起来的页面：书签与上次停留的页签都不能把内容调出来，
   // 否则页面容器带着 hidden 被点亮，屏幕上一片空白。
   if(pageHidden(tab)) tab = firstVisiblePage();
   // 账号页被合并掉之后（设置里的「账号独立成一个页签」关闭，默认），
@@ -12985,8 +13051,22 @@ async function loadAgents(showToast){
   try {
     const data = await getJSON('/agents');
     AGENTS_DATA = data || {};
+    // 远程看板（服务端 / Docker / OpenWrt）：/agents 只回 enabled:false + reason，
+    // 没有 clients / keys / models。一键写入没有落点，但「其他客户端」里的地址
+    // 照样能复制去手动接入，所以只收起依赖本机的那两块，页面本身留着。
+    if(AGENTS_DATA.enabled === false){
+      AGENTS_AVAILABLE = false;
+      AGENTS_REMOTE_REASON = AGENTS_DATA.reason || AGENTS_REMOTE_REASON;
+      renderAgentsRemoteNotice();
+      renderAgentManualUrls();
+      if(state){ state.textContent = '(远程看板，不提供一键配置)'; state.style.color = 'var(--dim)'; }
+      return;
+    }
     AGENT_MODELS = AGENTS_DATA.models || [];
     AGENT_KEYS = AGENTS_DATA.keys || AGENTS_DATA.api_keys || [];
+    // 正常拿到数据 = 本机可用，把可能残留的远程提示收掉。
+    AGENTS_AVAILABLE = true;
+    renderAgentsRemoteNotice();
     renderAgentConnForm();
     renderAgentCards();
     renderAgentManualUrls();

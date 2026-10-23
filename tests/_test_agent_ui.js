@@ -370,8 +370,10 @@ const check = (label, cond, extra) => {
   check('an unknown client is a no-op, not a crash',
         requests.filter(r => r.url.indexOf('/agents/apply') !== -1).length === 0);
 
-  // 服务端形态（看板不在网关本机）时入口整个撤掉（issue #246）：
-  // /agents/available 回 enabled:false → Tab 隐藏，?tab=agents 的书签退回网关页。
+  // 服务端形态（看板不在网关本机）时一键写入没有落点（issue #246），但入口
+  // **不再藏掉**：藏掉的后果是页签「刷新一瞬间有、随后消失」，用户只会以为
+  // 功能坏了。现在的契约是：页签留着，进页面后用一条说明讲清原因，并给出
+  // 远程也能用的手动接入地址。
   global.fetch = (url, opts) => {
     if (String(url).indexOf('/agents/available') !== -1) {
       const payload = {enabled: false};
@@ -385,12 +387,18 @@ const check = (label, cond, extra) => {
   };
   const navAgents = element('btnNavAgents');
   await api.loadAgentsAvailability();
-  check('a server-form panel hides the agents tab',
-        navAgents.style.display === 'none', JSON.stringify(navAgents.style));
+  check('a server-form panel keeps the agents tab in the nav',
+        navAgents.style.display !== 'none', JSON.stringify(navAgents.style));
   check('the availability flag flips to false', api.agentsAvailable() === false);
+  check('the page explains why one-click apply is unavailable',
+        element('agentRemoteNotice').hidden === false,
+        JSON.stringify(element('agentRemoteNotice').hidden));
+  check('the notice carries the manual base url',
+        /\/v1$/.test(element('agentRemoteUrl').textContent || ''),
+        element('agentRemoteUrl').textContent);
   api.switchMainTab('agents');
-  check('a stale agents tab falls back to the gateway page',
-        api.currentTab() === 'gateway', api.currentTab());
+  check('the agents tab still opens instead of silently redirecting',
+        api.currentTab() === 'agents', api.currentTab());
 
   process.stdout.write('agent config UI assertions passed (' + checks + ' checks)\n');
 })().catch(err => {
