@@ -3,8 +3,9 @@
 # 更新：docker compose pull && docker compose up -d
 services:
   wb-proxy:
-    # 追最新稳定版用 :latest；想固定版本可换成具体版本号（如 :v1.6.11）
-    image: ghcr.io/ardeyouxipianyi/workbuddy2api-hub:latest
+    # 使用本 fork 镜像（含公益站功能：站点聚合、出站身份伪装、测活 Key 校验、故障转移等）。
+    # 不要改回上游官方镜像 ghcr.io/ardeyouxipianyi/workbuddy2api-hub，否则公益站功能会丢失。
+    image: ghcr.io/wdw6733/workbuddy2api-new:latest
     container_name: wb-proxy
     restart: unless-stopped
     # Defaults to root (0:0), i.e. the historical behaviour. To run as your own
