@@ -146,6 +146,10 @@ const check = (label, cond, extra) => {
         chipText(chipOf(out, '丙 · 无记录')) === '今日签到 · 无记录'
         && (chipOf(out, '丙 · 无记录') || '').includes('badge off'),
         JSON.stringify(chipOf(out, '丙 · 无记录')));
+  check('unknown CN status is not presented as an upstream failure to check in',
+        (chipOf(out, '丙 · 无记录') || '').includes('无本地记录')
+        && !(chipOf(out, '丙 · 无记录') || '').includes('未签到'),
+        JSON.stringify(chipOf(out, '丙 · 无记录')));
   check('the failure chip is rendered as a failure, not as a success',
         (chipOf(out, '丁 · 失败') || '').includes('badge bad'),
         JSON.stringify(chipOf(out, '丁 · 失败')));
@@ -242,7 +246,7 @@ const check = (label, cond, extra) => {
         historyOut().includes('title="&lt;img src=x onerror=alert(1)&gt; 上游 500"'),
         historyOut().slice(0, 300));
   check('the message cell truncates instead of widening the modal',
-        historyOut().includes('text-overflow:ellipsis'));
+        historyOut().includes('note-clip'));
   check('both results render, each on its own row',
         historyOut().includes('badge bad') && historyOut().includes('badge ok'));
 
@@ -302,7 +306,7 @@ const check = (label, cond, extra) => {
   check('the modal markup is in the shipped page',
         modal.includes('签到与每日活跃记录'), modal.slice(0, 80));
   check('the history table is a data-cards table, so it collapses on a phone',
-        modal.includes('<table class="data-cards">'));
+        modal.includes('<table class="data-cards activity-table">'));
   check('every filter control is in the modal',
         ['actRange', 'actUid', 'actTask', 'actResult'].every(id => modal.includes('id="' + id + '"')));
   check('an empty or failed list spans the whole card grid',

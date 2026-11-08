@@ -1,3 +1,377 @@
+## v2.0.1
+
+- **国际版 DeepSeek 出站别名**：客户端与 `/v1/models` 继续展示 `deepseek-v4.1-flash`，实际发给国际版上游时使用 `deepseek-v4.1-flash-sg`；显式请求 `-sg` 保持原样，API Key 模型白名单仍按 base 校验，响应与用量记录保留逻辑模型，实际计费模型单独记录。`WB_INTL_MODEL_ALIAS=0` 可关闭映射。
+- **移除废弃的免费额度耗尽回退积分版**：删除设置页开关、后端 6004 自动回退到付费 `-sg` 通道的逻辑与相关测试；免费额度耗尽后不再自动产生积分扣费。
+- **并发名额与账号筛选修复**：上游 400 / 未处理 4xx 透传前归还账号并发名额，避免账号被永久标记为占满；网关重启或重新登录后重置旧账号筛选，避免账号列表被过滤成空。
+- **面板与日志体验修复**：修复手机端账号区按钮和徽章挤压、自绘下拉面板被祖先裁剪、权重列不可读；聊天请求头到达时记录 `chat head`，`responses:` 日志同时记录客户端与实际生效的推理强度。
+- 全量测试：**277 个套件：209 个 Python + 68 个 JS，`277 passed, 0 failed, 0 skipped`**。
+
+## v2.0.0
+
+**项目停止维护（2026-11-06）**：后续不再更新代码、不跟进上游变化、不再处理新的 issue / PR。感谢大家的 star。
+
+- **设置页分组语言切换修复**（#804）：修复面板切到正體中文或英文后，点击设置页分组胶囊导致整页区块被隐藏的问题；改为使用 i18n 翻译前保留的原文进行归类，并补上漏归的「选择网页活跃提示词」。
+- **用量聚合缓存补写**（#805）：checkpoint 写盘被状态锁占用、状态暂不可序列化或写入异常跳过时，按类节流告警并登记异步补写；采用 30 秒起指数退避、封顶 15 分钟，成功后取消。新增 64MB 落后告警和按 pid 隔离临时文件，避免某类缓存长期静默停更、重启后重复全量折叠。
+- 全量测试：**273 个套件：206 个 Python + 67 个 JS，`273 passed, 0 failed, 0 skipped`**。
+
+## v1.10.11
+
+- **413 响应不再被连接重置吞掉**（#799）：请求体超过面板配置的上限时先写出 413，再在有限时间内按 Content-Length / chunked framing 排空上传，避免关闭套接字触发 RST 导致客户端只看到连接重置。
+- **CodeArts 参数校验与账号保护**（#794）：`max_tokens` / `max_completion_tokens` 按模型目录的输出上限收敛，字符串 `stop` 自动归一化为数组；`The request param is invalid` 等客户端参数错误返回 400，不再重试或冷却整个 CodeArts 账号池。
+- **恢复两条提示词改写**（#796）：修复 `Main branch` 与 `To give feedback` 在 v1.10.5 后退化成空操作的问题，并增加禁止 `from == to` 的回归测试。
+- **账号分组**（#707）：账号新增可选分组，支持按组筛选、导入时指定分组、单账号编辑、分组启停，以及刷新凭证 / 测试 / 补积分等批量操作仅作用于当前分组；API Key 账号选择器也支持按组选入与移除。
+- **API Key 配置示例**（#704）：设置页新增可折叠的 Base URL、cURL 与各协议端点示例，并支持一键复制。
+- **小账号池会话粘滞修复**（#718）：页大小覆盖整个 realm 账号池时不再按页轮转，长会话固定到同一账号，避免每轮换号造成前缀缓存丢失和 Token 消耗翻倍。
+- **检查更新支持代理槽**（#798）：可在设置页指定 GitHub 更新检查使用的代理槽；槽停用或删除后自动回退直连，凭证不会出现在设置响应中。
+- **CodeArts 模型 ID 精确匹配**（#797）：明确 `deepseek-v4.1-flash` 与 `deepseek-v4.1-flash-1017` 是两个独立上游模型，不做别名或静默回退。
+- **模型倍率显示**（#774）：live / cache 目录返回的 `x0.00` 不再覆盖内置表已知的付费倍率，避免真实扣积分却显示免费。
+- **风控连坐暂停设置**：面板可配置暂停时长、查看剩余倒计时并立即解除；测试与运行时统一读取 `settings.json`，不再被模块级环境变量快照覆盖。
+
+## v1.10.10
+
+- **新导航布局设为默认布局**：面板默认采用新版侧边功能导航布局，结构更聚焦；在主题选项菜单中提供「返回传统布局」，支持一键切换并记住偏好。
+- **风控连坐暂停保护可配可立即解除**：设置页「稳定性」新增「风控连坐暂停保护」卡片。上游 403 / 11140 异常行为触发全区域暂停派发时，面板展示实时剩余倒计时，提供「立即解除暂停」一键解冻恢复请求；支持自定义暂停时长（默认 1800 秒，设为 0 可彻底关闭连坐熔断保护），且保存更短时间时即时截断现有倒计时。
+- **账号列表分页与积分补领体验优化**：账号列表采用客户端 50 条分页展示；页面切换与定时巡检跳过轮询指纹请求，按需补领积分。
+- **出站与身份增强**：Claude Code 自述句指纹中性化；支持 OAuth 登录时显式指定代理槽；11-128 取证开关及端到端稳定性加固。
+
+## v1.10.9
+
+- **面板布局与主题**：默认使用控制台布局和 Alibaba 配色，保留浏览器已有偏好；支持经典布局以及可选的新导航布局，后者提供桌面侧栏、移动端导航与分组设置（#725、#764、#765）。
+- **面板登录**：增加可选的保持登录，默认关闭；兼容浏览器部分存储不可用的情况（#763）。
+- **CodeArts 账号与调度**：支持账号备注、账号任务开关、积分刷新、签到和令牌保活调度；关闭账号任务后不再由排队或惰性签到触发（#759、#762）。
+- **CodeArts 模型与请求**：支持图片输入和模型视觉能力，校验推理档位并转发采样参数；修复 OpenAI 格式错误响应中 429 状态码丢失的问题（#758、#760、#761）。
+
+## v1.10.8
+
+CodeArts 工具归一化与空函数修复（#750 / #752）、配置并发安全（#751）、账号 UID 注入防护（#757）、日志轮转日限校验（#755）、出站身份诊断工具（#756）与 DeepSeek Flash 真实计费校准：
+
+- **CodeArts 出口工具定义归一化，修复 `Tool function cannot empty`（PR #752，感谢 @XXXoooM，解决 #750）**：
+  - CodeArts 出口构造请求体时接入完整的 `normalize_tools()` 归一化清洗：客户端发来的空 `function`、裸服务端工具（如 `{"type": "web_search"}`）或扁平声明（`{"name": ...}`）统一转换为合规 function schema；
+  - 缺失的 `parameters` 自动补齐为 `{"type": "object", "properties": {}}`，非法/空函数名条目丢弃；
+  - 当所有工具均不可用或客户端传递 `tools: []` 空列表时，彻底从请求体中移除 `tools` 与 `tool_choice` 字段，避免触发华为云上游 `Tool function cannot empty` 拦截。
+- **CodeArts 配置保存并发安全防护（PR #751，感谢 @XXXoooM）**：
+  - 将 `wb_codearts.save_config()` 完整的读-改-写三步统一纳入模块 `_LOCK` 保护，防止多浏览器/并发保存请求导致后写入者静默覆盖前者的配置字段。
+- **CodeArts 账号 UID inline onclick 安全收敛（PR #757，感谢 @ayeaaaa）**：
+  - 看板中的 CodeArts 账号 UID 操作按钮增加字符白名单安全过滤（`uidSafe`），防止单引号突破内联事件处理器导致脚本注入风险。
+- **每日用量折叠按 inode + 尾签名校验 offset（PR #755，感谢 @XXXoooM）**：
+  - `daily_usage_stats()` 接入 `_log_offset_holds()`（inode/设备/大小）与 `_log_tail_signature()` 尾部签名验证，彻底解决 `logrotate copytruncate` 原地清空并追加写入时，增量折叠静默跳过新内容或重复计入已被清空旧数据的问题。
+- **出站身份诊断脚本与 11-128 排障说明（PR #756，感谢 @XXXoooM）**：
+  - 新增离线诊断工具 `scripts/diagnose_identity.py`，脱敏输出账号出站身份信息、`x-stainless-*` 头族与请求特征；
+  - 新增 [`docs/TROUBLESHOOTING-11-128.md`](docs/TROUBLESHOOTING-11-128.md) 完整排障指引。
+- **国际版 `deepseek-v4.1-flash` 统一真实 0.11x 计费**：
+  - 经实测证实国际版官方对 DeepSeek Flash 已全面按 0.11x 计费，彻底清理了此前的「限时免费 0.00x」假标定；
+  - 移除设置页冗余的「国际版 DeepSeek 后台出站模型」切换卡片及模型列表中多余的「原生免费 / 强制 -sg」切换胶囊，模型列表恢复整洁透明展示。
+- **UI 与稳定性修复**：
+  - 账号删除时联动清除任务快照（#745，提交 `d233b17`）；
+  - 自绘下拉面板高度视口防溢出修复（#628，提交 `ef479f7`）；
+  - 嵌套 namespace 丢失父路径与 `responses_to_chat()` tool_choice 回写修复（#736，提交 `ef479f7`）；
+  - 模型列表长文本放开折行限制并增加安全最小宽度（#749，提交 `e33ec72`）；
+  - 测试进程树隔离探针优化（PR #753）与 Windows 网络读截止时间粒度适配（PR #754）。
+
+验证：
+- 完整本地测试套件 261 项全量通过（198 Python + 63 JS，`261 passed, 0 failed, 0 skipped`）；
+- `scripts/check_clean_checkout.py` 严格校验干净通过；
+- 本地 8788 网关热重启冒烟验证正常。
+
+## v1.10.7
+
+国内版 deepseek-v4.1-flash 计费与出站路由修复（#748）、CodeArts 每日签到按活动类型识别与可选自动签到（#747）：
+
+- **国内版 deepseek-v4.1-flash 不再误标免费与误走 -sg（PR #748，感谢 @zqisme）**：
+  - `model_entry()` 的免费（`x0.00`）与强制 `-sg` 改写口径只在 `realm == "intl"`（国际版）下生效；国内版目录严格保持目录声明的 `0.11x` 实测计费标准，不再被误标为「限时免费 0.00x」造成假免费误导。
+  - `_apply_deepseek_flash_target()` 出站改写限制仅在国际版生效，避免开启强制 `-sg` 时国内版出站被改写成国内目录并不存在的 `-sg` 导致 400 报错。
+  - 面板「网关模型清单」中的「出站: 原生免费 / 强制 -sg」徽章与切换胶囊按浏览区域隔离，仅在 `window.VIEW_REALM === 'intl'` 时显示，国内版视图保持真实费率展示。
+  - 新增 `tests/_test_deepseek_flash_realm.py` 覆盖。
+- **CodeArts 每日签到按活动类型识别与可选自动签到（PR #747，感谢 @zqisme）**：
+  - **按活动类型识别（修复假成功）**：上游 CodeArts 每日签到（每日赢 100 积分）是 `type=USER_LOGIN` / `extra.triggerEvent=user.login` 活动，换季后其 `campaignId` 会变化（历史为 1/4，现为 34）。`checkin_account()` 不再硬编码 `(1, 4)` 白名单过滤，支持按类型动态识别，彻底修复此前换季导致签到跳过、返回「新用户注册送 4000 积分: 已领取」但当天 100 积分实际未领取的假成功。
+  - **可选惰性每日自动签到**：在 `pool_for()` 中惰性检查未签到账号并由后台 daemon 线程自动领奖；每账号每天上限 3 次、间隔 ≥1 小时，进程内与手动点击互斥防竞态。设置项 `codearts.credits_auto_claim` **默认 `false`**（按需开启），开启后不再需要每日手动点面板。
+  - 新增 `tests/_test_codearts_checkin_campaign.py` 覆盖。
+
+验证：
+- 本地完整测试矩阵：259 个套件全部通过（196 Python + 63 JS，`259 passed, 0 failed, 0 skipped`）。
+- 发布工程套件 `_test_release_engineering.py` 与发布资产套件 `_test_release_assets.py` 全部通过。
+
+## v1.10.6
+
+生图与异步生视频媒体能力集成（#728）、并发日志原子追加加固、设置页二级分类胶囊导航：
+
+- **新增生图 / 生视频媒体能力（PR #728，感谢 @a1094174619）**：
+  - **文生图与图生图**：支持 `POST /v1/images/generations`、`/v1/images/edits`（基于混元模型），参数对齐 OpenAI 规范。
+  - **异步生视频**：支持 `POST /v1/videos`（支持 MiniMax 与 Kling，支持异步轮询、产物直链下载与 `?wait=1` 阻塞）；支持首尾帧与最多 9 图 + 3 视频 + 3 音频参考素材。
+  - **本地排队与智能分发**：生视频默认 3 并发，超限任务在**本地排队（不向上游提交、不扣积分）**；任务优先调度到没有进行中任务的空闲账号。
+  - **按分辨率与素材实测计价**：根据真实扣费反推单价，区分分辨率（768P vs 2K 差异 60%）与参考素材（带素材扣费 2 倍）分档报价，派发前校验积分余额。
+  - **参考素材预签名自动转存**：输入图/视频支持 data URL 与公网地址，自动完成上游 COS 预签名转存，阻断本地文件路径以防任意文件读取。
+  - **零回归与安全隔离**：媒体模块默认完全关闭（未开启时路由返回 404），不影响普通对话路径。
+- **并发日志原子追加加固（wb_usage_io.py）**：底层追加写入增加 Windows 文件锁（msvcrt.locking）与 POSIX O_APPEND 单系统调用保证，彻底消除高并发写入 usage.jsonl 时的断行与丢行问题。
+- **设置页二级分类胶囊导航（方案 A）**：设置页 36 项配置按功能归类为 6 个胶囊分类（访问与密钥、模型与调度、限额与并发、出口与网络、自动化、计费与运维），单行平滑滚动防折行，窄屏模式自动隐藏重复大纲条，支持偏好持久化。
+
+## v1.10.5
+
+国际版 DeepSeek 免费通道恢复与出站节点切换、Codex 首段脱敏去指纹修复与 glm-5.1 档位补齐：
+
+- **国际版模型目录恢复 `deepseek-v4.1-flash`**：实测上游并未下线不带 `-sg` 的基础模型，请求完全正常（200 OK 并带完整思维链），且返回用量 `credit: 0`（免扣除积分）；带 `-sg` 版本扣除 0.01~0.02 积分。网关现将 `deepseek-v4.1-flash` 补回国际版静态目录并置于首选推荐位，同时保留 `-sg` 作为付费备选通道。
+- **国际版 DeepSeek 出站节点动态切换与面板模型清单联动**：
+  - 新增设置项与环境变量 `WB_DEEPSEEK_FLASH_FORCE_SG`，可控制客户端请求 `deepseek-v4.1-flash` 时网关出站是走原生免费通道（0 积分，默认）还是强制转为 `deepseek-v4.1-flash-sg`（新加坡付费通道，0.11x）。
+  - 第三方客户端拉取 `/v1/models` 时始终同时返回两个模型，其用量与出站行为完全随网关设置动态生效。
+  - 面板「网关模型清单」表格深度联动：实时呈现 `[出站: 原生免费]` / `[出站: 强制 -sg]` 状态徽章，并在模型行内提供快捷切换胶囊 `[原生免费 (0x) | 强制 -sg (0.11x)]`，即点即存。
+- **修复 Codex 新会话稳定 400 并补账号/出口归因**（#743 / PR #744）：旧脱敏规则把中性句改写成 `You are a coding agent running in the Codex CLI tool, ...`，恰好命中 `SANITIZE_FEATURES` 指纹导致出站 body 保留 11-128 指纹；现整句恢复中性句。400 及 `HTTPError` 直接透传时带回 `account_uid` / `proxy_slot` / `proxy_exit`，`usage.jsonl` 与错误日志可精准定位账号与代理出口端口；成功行同步写入出口字段。
+- **修复 glm-5.1 全部 400 / 11150**（PR #742）：上游现在要求 glm-5.1 显式带推理档位，网关在缺档位或关思考时自动补齐目录档位（`medium`），客户端指定档位原样透传。
+- **临期积分优先调度优化**（PR #741）：权重从原本单纯按天数粗暴取整升级为紧迫度乘剩余量（对数压缩），解决生产号池权重全相同退化为纯轮询的问题；设置页说明文案三语同步。
+
+## v1.10.4
+
+国内版成长任务全能引擎与 Buddy 盲盒自动化扩展，并致谢社区开源项目：
+
+- **开源致谢与架构对齐**：
+  - 本模块任务事件模型、小程序专属埋点指纹与动态专家解析参考并致谢开源项目 [L0NE-6/WorkBuddy-Daily](https://github.com/L0NE-6/WorkBuddy-Daily)（MIT License）。
+  - 猫猫旅行与成长能量开盲盒（Buddy 盲盒）安全生命周期参考并致谢开源项目 [88lin/workbuddy-auto-signin](https://github.com/88lin/workbuddy-auto-signin)（MIT License）。
+- **补齐官方新增任务支持**：新增工作台搭建师（workstation_expert）、中国电商运营专家（xpert_use_maidehao）、抖音策略师（xpert_use_douyinyin）、商家宣传设计师（xpert_use_shangjia_xuanchuan）、直播电商教练（xpert_use_bowangwang）、PC灵感功能（Sequential_Tasks_7）。
+- **动态专家深链解析**：遇到未预录入但上游临时下发的专家类任务（如带有 jump_url / deeplink），自动提取真实专家 ID（x_xxx）并构造 xpert_actual_use 事件推进进度，避免上游新增专家任务时被漏掉。
+- **解除资料库与桌面对话的跳过限制**：体验资料库（Library_read）接入官方文档点击事件（web_element_click）上报点亮；桌面对话（RichMeow_Chat）接入 6 连桌面端对话事件链点亮并领奖。
+- **成长能量自动开 Buddy 盲盒（do_buddy_open）**：检测到猫猫空闲或旅行归来领奖后，自动调用 /v2/activity/growth/buddy/quota 查询可开数量，并调用 /v2/activity/growth/buddy/open 开出宠物，消耗闲置能量；领奖后自动衔接开盒并立即派出新一轮旅行。
+- **微信小程序链式成长任务自动化**：支持使用小程序专属标头（X-Client-Platform: miniprogram）与埋点指纹（workbuddy-mp）对 Sequential_Tasks_1 ~ Sequential_Tasks_6 以及校园日活动进行扫描、接取、事件上报与领奖。
+
+## v1.10.3
+
+- **同步国际版模型目录与计费快照到上游现状**（#738 / #739）：对齐上游最新模型发布与下线，对话模型由 24 项收敛至 22 项；新增 `deepseek-v4.1-flash-sg`（x0.11）、`gpt-6.1-sol`（x1.33）、`gpt-6-sol`（x1.33）、`gpt-6-luna`（x0.07）、`gemini-3.8-flash`（x0.95）、`kimi-k3.1-pro`（x0.97）、`kimi-k3.1-pro-highspeed`（x1.56）、`minimax-m3.1-flash`（x0.08）；移除上游已下线的旧版本模型；排除纯生图/生视频模型（`hy-image-3.5`、`kling-video-v3`）；修复 `-sg` 变体在无同名基名时被丢弃的问题；修复时段定价跨午夜窗口失效问题。
+- **修复 CodeArts OAuth 浏览器回调必然失败**（#735）：支持将华为云 OAuth 回调携带的 `state`（含 `<hex>.pkg` 与裸 hex）精确匹配为会话标识 `ticket_id`，修复浏览器授权回调必然报「缺少会话标识」导致无法添加账号的问题。
+- **修复 CodeArts 非流式请求提前归还账号并发竞争**（#740）：在非流式聚合完成后立即在 finally 中调用 `upstream.close()` 归还账号并发，并在 `open_chat` 遇瞬时并发占满时增加缓冲等待，消除背靠背请求偶发 502 的竞态。
+- **429 恢复时刻测试夹具解耦**（#737）：将 429 恢复时刻测试夹具从写死固定日期改为基于运行时钟动态推算，消除发布次日因时刻过期引发的测试失败。
+
+验证：
+- 本地完整测试矩阵：247 个套件全部通过（184 Python + 63 JS，`247 passed, 0 failed, 0 skipped`）。
+- 发布工程套件 `_test_release_engineering.py` 与发布资产套件 `_test_release_assets.py` 全部通过。
+
+## v1.10.1
+
+- **429 响应附带绝对恢复时刻**（#720）：429 响应带上 `X-RateLimit-Reset`（epoch 秒）与 `X-RateLimit-Reset-At`（ISO-8601 UTC），正文附带 `reset_at` 字段；优先提取上游 6004 正文的真实墙钟，未携带时按网关统一冷却窗口换算，解决多进程/分布式客户端相对时间漂移。
+- **工具归一化过滤非法 function.name**（#726）：`normalize_tools` 自动过滤不符合 `^[A-Za-z0-9_-]{1,64}$` 命名规范的工具，丢弃无 function 载荷的服务端工具声明（如 `web_search`），修复上游 400 / 11133（`tools[N].function.name` 校验失败）。
+- **CodeArts 会话上限与排队修复**（#723）：CodeArts 请求补充发送 `x-ot-session-id`、`user-session-id`（账号级稳定散列）与每请求随机 `x-ot-trace-id`，解决华为云将连续请求误判为并发新建会话导致触碰 3 会话上限、出现 `TM.00001041` 报错与 90 秒排队阻塞的问题。
+- **账号代理槽支持账号密码认证与格式自动规整**（#648）：代理槽完整支持带认证的 `http://user:password@host:port` 代理（出站连接池与代理隧道自动注入 `Proxy-Authorization: Basic`），并对服务商常见的 `host:port:user:pass` 格式与缺失 scheme 的代理自动清洗归整。
+
+验证：
+- 本地完整测试矩阵：246 个套件全部通过（183 Python + 63 JS，`246 passed, 0 failed, 0 skipped`）。
+- 发布工程套件 `_test_release_engineering.py` 与发布资产套件 `_test_release_assets.py` 全部通过。
+
+## v1.10.0
+
+- **CodeArts 原生第三出口（单进程）**（#712 / #715）：新增 `codearts` 原生出口，看板可在「国际版 / 国内版 / CodeArts」三区域间自由切换；`/v1/models`、`/v1/chat/completions`、`/v1/responses` 与 Anthropic Messages 均直连华为云 CodeArts。进程内完整实现 OAuth2 PKCE + DPoP、token 自动续期轮转、账号池并发与冷却管理、内置与限时福利模型发现、聊天 SSE 协议转换与每日签到/积分查询，不再需要单独运行 codearts2api 服务；华为凭据不出本机，默认关闭。
+- **CodeArts 账号代理槽与统一出站连接池**（#712 / #715）：CodeArts 账号复用与 WorkBuddy 一致的出口代理槽，支持连接复用、代理认证及账号级出口独立绑定，槽位变更自动跟随，失效自动回退直连。
+- **CodeArts 权限安全与首帧增强**（#715）：修复 CodeArts 文本流首帧规范化转换；对暂不支持的视觉/图片输入主动拦截并回退 400 明确提示；严格校验 API Key 的模型禁用、白名单与账号绑定范围；OAuth 回调严格校验会话标识并限制跳转安全。
+- **Key 允许账号选择器展示与搜索备注**（#708 / #717）：API Key 编辑弹窗内的允许账号选择器中补充账号备注展示，并支持在搜索框内直接按备注筛选，便于大规模账号池精细化权限配置。
+- **今日活动状态区分「无本地记录」**（#706 / #716）：网关当天缺少加油站或成长计划活动流水时，状态胶囊精准展示为「无本地记录」，避免外部打卡已被上游记录却被本地误报为「未签到」。
+- **单请求体上限面板动态调节**（#709 / #714）：设置页支持将 HTTP 请求体限制在 1–256 MB 范围内动态热配置并立即生效；超限返回清晰的 413 状态并提示当前限额；超限分块传输自动提前熔断，避免无谓占用上行带宽。
+- **修复设置页出现两张「上游响应头超时」卡片**（#710）：清除设置页重复的 DOM 节点，解决第二张卡片数据未回填以及点击保存时读取首张卡片数值的逻辑串扰。
+- **看板「最近请求」的时间补上日期**（#700 / #713）：数据看板的实时请求流水列表在跨天时智能显示 `MM-DD HH:MM`，当日请求保持 `HH:MM:SS`，时间戳缺失显示占位符号 `—`。
+
+验证：
+- 本地完整测试矩阵：244 个套件全部通过（181 Python + 63 JS，`244 passed, 0 failed, 0 skipped`）。
+- GitHub Actions 跨平台 CI（Ubuntu 3.9 / Ubuntu 3.12 / Windows 3.12 / revert guard）全部通过。
+- 发布工程套件 `_test_release_engineering.py` 与发布资产套件 `_test_release_assets.py` 全部通过。
+
+## v1.9.2
+
+- 数据看板在同一时间范围的请求尚未完成时跳过重复轮询，避免慢请求堆积（#656）；首次冷计算仍需扫描历史数据。
+- 更新卡片直接显示安装按钮不可用的原因，以及可安装时的操作提示（#696）。
+- 面板密码加密组件不可用时显示环境错误（#658）；启动时指定的面板密码无法设置则退出，避免意外启用旧密码或默认密码。
+
+## v1.9.1
+
+- **SSE 终态停止读取**（#692）：设置 `WB_STOP_AT_SSE_DONE=1` 后，在聚合、Responses 和 Chat 路径遇到 `[DONE]` 时停止读取；默认关闭。
+- **HTTP 错误正文缓存**（#693）：设置 `WB_CACHE_HTTP_ERROR_BODY=1` 后缓存首次读取的错误正文，供后续读取；缓存最多保留首次读取的字节数，默认关闭。
+
+验证：完整测试套件 233 通过；隔离面板登录、控制台和真实上游请求通过。
+
+## v1.9.0
+
+本版汇总 `v1.8.0` 之后的十个社区 PR，修复 APISIX 401 挑战头判定、DSH 11128 渠道指纹、收费模型 6004 跨重启持久化、池空 503/429 报错精准归因与用量行对齐、/health 区域与模型细分、零费率模型保留额度豁免、国际版每日活跃 11140 风控持久化避让，以及看板下拉与活动记录窄屏布局优化。套件 231 个（172 Python + 59 JS）。
+
+- **认网关的 `WWW-Authenticate` 判死 401，面板测试不再把「凭证真失效」显示成一页代理报错**（#686）：国内版上游是 APISIX，凭证被拒时回的是 `<html>401 Authorization Required</html>`，死因只在响应头 `WWW-Authenticate: Bearer realm="copilot", error="invalid_token"` 里。#435 为解决「中间代理页把健康号踢出池子」把所有带 `<html` 的 401 一律豁免，导致真失效的账号未被标记；现在 `http_error_message()` 将挑战头置前展示，`_auth_failure_text()` 在 HTML 豁免前识别 RFC 6750 的 `invalid_token`，真失效账号及时退出派单。新增 `tests/_test_token_expired.py` 断言。
+- **中和 DSH 文件引用段 11-128 渠道指纹**（#684 / #680 / #688 / #677 / #675）：DSH（DeepSeek Harness）官方插件 `@deepseek-ai/dsh-file-reference` 注入的 `FILE_REFERENCE_PROMPT` 被上游识别为非官方客户端特征并返回 400 / code 11128。通过对首句增加定语关系代词 `that` 进行微调，在保持模型语义等价与幂等的前提下打断连续文本匹配。新增 `tests/_test_sanitize_fingerprint.py` 回归覆盖。
+- **国内版收费模型撞 6004 也保住"配额耗尽"这个事实**（#668 / #672）：国内版计费模型（如 `deepseek-v4.1-flash`）撞上游 6004 配额耗尽时，将 `cappedAt` 连同窗口信息落盘至 `accounts/model_windows.json`，重启后由 `restore_window_cooldowns()` 挂回，面板不再误判为短时 429 临时限流。新增 `tests/_test_cap_mark_any_model.py`。
+- **池空报错说清"在等谁、等多久"**（#665 / #671）：API Key 绑定账号场景下，池空 503 报错精确定位绑定候选账号并输出逐账号原因；候选账号仅因等待模型冷却窗口恢复时，改回返回 429 与 `Retry-After`，避免客户端高频空转重试。新增 `tests/_test_no_usable_account_scope.py`。
+- **/health 按区域与模型报可用数**（#667 / #670）：`/health` 保留原汇总字段，新增 `accounts_by_realm`、`accounts_ready_by_realm`、`accounts_ready_current_realm` 与 `models_ready`，带 Key 调用时返回专属 `key_accounts_ready` 与 `key_accounts_bound`，准确反映模型可用性。新增 `tests/_test_health_readiness.py`。
+- **池空失败的状态码与用量行对齐**（#666 / #669）：统一错误出口（`upstream_failure_response()`），先确定状态码再落盘，使 `usage/usage.jsonl`、请求日志与实际给客户端返回的 503 状态码一致，消除 502/503 混淆。新增 `tests/_test_error_status_consistency.py`。
+- **签到与活跃记录窄屏挤压修复**（#653）：说明列与昵称列省略号截断收敛至 `.note-clip`，中屏上限收至 300px，手机端卡片折行显示全文，短标签列（时间/区域/任务/来源/结果）禁止逐字折行，行高恢复单行 42px。
+- **看板下拉不再误判全宽竖排**（#652）：自定义下拉 `enhance()` 仅认显式 `style.width: 100%`，避免 flex 子项与隐藏页签将 computed display 规范化为 block 导致 16 处下拉误判全宽竖排的问题。新增 `tests/_test_custom_select.js`。
+- **保留积分不再饿死免费模型**（#650）：正数 `reserve_credits` 只拦截付费或目录未知的模型；本区域目录标为 `x0.00` 的零费率模型免除阻断，避免低额保留误伤免费模型。新增 `tests/_test_reserve_free_models.py`。
+- **国际版每日活跃持久化 11140 风控限制并停止重试**（#649 / #659 / #661）：国际版桌面打卡腿遇 HTTP 403 / code 11140 时调用 `note_restricted()` 并持久化 `restrictedUntil`，限制期内 `can_daily_chat()` 返回 False，调度器自动跳过，避免重复撞墙加重风控。新增 `tests/_test_daily_chat.py` 覆盖。
+
+验证：
+
+- 本地完整矩阵：`231 passed, 0 failed, 0 skipped`（63s 全绿）。
+- GitHub Actions CI：Ubuntu 3.9、Ubuntu 3.12、Windows 3.12 与 revert guard 均通过。
+- 发布工程套件 `_test_release_engineering.py` 与发布资产套件 `_test_release_assets.py` 全部通过。
+
+## v1.8.0
+
+本版汇总 `v1.7.33` 之后的四个修复，并补记此前已进入发布页、但未写入仓库 CHANGELOG 的三项改动。套件 226 个（167 Python + 59 JS）。
+
+> **维护状态（2026-10-23）**：WorkBuddy 对非官方客户端的识别与拦截持续收紧，维护者近期工作压力增大，更新与 Issue / PR 处理将显著放缓。上游可能随时彻底收紧导致不可用；账号风控 / 限流 / 封禁风险由使用者自行承担。请优先使用官方客户端，不要使用主账号或商业转售。
+
+- **更新检查超时放宽到 10 秒**（#640）：Releases API 受限时，回退下载路径在代理出口实测需要 4.2～10 秒；旧的 5 秒上限会把本可成功的回退一起掐掉。现在两条路径各有 10 秒，失败仍按每日节流重试，不会挂住面板。
+- **stderr 日志通道不再阻塞请求线程**（#642）：请求线程只向 2000 行有界队列 `put_nowait()`，由单个守护线程负责真正写入；队列满时丢行并计数，首次和每 1000 行写一条 WARN 到看板日志。退出路径用 0.5 秒超时刷队列，`sys.stderr is None`（pythonw）直接跳过。日志内容、脱敏与看板顺序不变。
+- **桌面 chat 可选协议一致性**（#643）：设置进程环境 `WB_DESKTOP_CHAT_COMPAT=1` 后重启，仅桌面产品的 chat 去掉浏览器请求头，补齐 SDK runtime 元数据与 B3 parent span。默认关闭；CLI、VSCode、计费 REST、请求体、设备 token 与退避逻辑不变。参考 workbuddy2api-panel 的桌面报文对照，未独立复核原始抓包，不构成 TLS 指纹模拟或免封保证。
+- **国际版每日活跃证书失败降级**（#645 / #647）：ACP 沙箱域名由 EdgeOne 下发 `*.cdn.myqcloud.com` 通配证书，Python ssl 必然报 Hostname mismatch。国际版现在也能按 `www.workbuddy.ai` 调用 `POST /v2/report`，连登查询同样按账号出口选 base；设置页新增「证书失败改走活跃上报」，**默认关闭**。仅证书类错误可降级，沙箱未就绪、轮次超时、业务拒绝仍如实失败；回退上报被拒时保留当天未完成状态供下轮重试。
+- **补记 v1.7.31 发布内容**：恢复 `model_aliases` 映射并避免后台模型改写误伤显式选择（#617 / #619）；收窄 CN 专属模型判定（#618）；OpenCode 一键配置写入真实 `limit.context` / `limit.output`（#625）；Chat / Responses / Anthropic Messages 三条流式路径在真实静默期发送 SSE 心跳（#578）。
+
+验证：
+
+- 本地完整矩阵：`226 passed, 0 failed, 0 skipped`。
+- GitHub CI：Ubuntu 3.9、Ubuntu 3.12、Windows 3.12 与 revert guard 均通过。
+- 发布前补跑发布工程与资产套件、`py_compile`、`git diff --check` 与干净检出检查。
+- 本机没有真实账号池，**未执行网关到 WorkBuddy 上游的真实模型冒烟**；#645 的上游证书恢复与真实账号连登 `0 -> 1` 仍需部署方复测。
+
+## v1.7.33
+
+四个社区 PR 的集成版本，并自本版起进入低频维护。套件 225 个（166 Python + 59 JS）。
+
+> **维护状态（2026-10-23）**：WorkBuddy 对非官方客户端的识别与拦截持续收紧，维护者近期工作压力增大，更新与 Issue / PR 处理将显著放缓。上游可能随时彻底收紧导致不可用；账号风控 / 限流 / 封禁风险由使用者自行承担。请优先使用官方客户端，不要使用主账号或商业转售。
+
+- **成功请求解除凭证失效标记**（#630）：`note_success()` 现在清除进程内的 `token_expired`，单账号测试、一键测试与真实派单成功后都会立即恢复面板徽章与派单资格；没有 access token 的账号仍不可派发。`tests/_test_token_expired.py` 共 9 项。
+- **Responses 流式首段工具参数增量**（#632）：首个 `tool_calls` 分片携带的参数现在会在 `output_item.added` 后发出，并且只累计一次；覆盖部分 / 完整 / 空首段、交错调用和 custom 工具，避免下游拼接与最终 `arguments` 不一致。
+- **每日活跃改为预算 + 有序候选序列**（#635）：旧的六个互相覆盖的旋钮收敛为单账号预算（默认 600 秒，0 = 不限）与有序模型候选（至少两轮）。时段改为到期窗口判定，新增启动补跑、网页会话卡死收尾、登记表上界与预算内退避；旧首选模型与已启用回退组合会迁移到新列表。
+- **429 模型窗口跨重启恢复**（#638）：账号加载时从 `model_windows.json` 恢复未到期的模型冷却，过期窗口不挂，损坏状态文件不阻断加载；同时清理冷却起始时刻残留。
+- **维护与文档**：README 顶部新增低频维护公告、上游收紧与账号责任说明，同步版本徽章、下载入口和本版记录；版本号同步到 `wb_proxy.py`、OpenWrt `PKG_VERSION` 与 README。
+
+验证：本地 `225 passed, 0 failed, 0 skipped`。本机无真实账号池，未执行到 WorkBuddy 上游的真实模型冒烟。
+
+## v1.7.30
+
+15 笔社区改动：签到 / 保活 / 调度器判定修复、面板闸门与自绘下拉框、流式 chunk id、面板请求体排空、Pro Only 改由目录驱动、Codex 远程压缩、账号级并发与粘滞、静态 API Key 账号、会员档位胶囊、每日活跃会话释放。套件 222 个（165 Python + 57 JS）。
+
+- **调度器日志与区域风控闸门改取正在运行的 wb_proxy**（#594）：网关以 `python[w] wb_proxy.py` 启动时主模块是 `__main__`，`import wb_proxy` 会再加载一份副本；副本的 `LOG_STORE` 是 None、风控暂停状态也是另一份，于是调度器日志全部掉进黑洞、巡检看到的 `hold` 恒为 0。现在先取 `__main__`，再退回已加载的模块。
+- **签到业务失败不再记成成功**（#596）：`200 + code 10001 +「请求处理中，请勿重复操作」` 等明确失败回执曾被判成签到成功，现在按失败处理。
+- **一键签到按任务开关选号**（#598）：批量签到只挑 `tasksEnabled` 的号，停用账号不再被无差别签到。
+- **Token 保活提前量必须大于巡检间隔**（#600）：写死的 2 小时远小于 24 小时巡检间隔，约 92% 的到期时刻要等过期后才补；现在提前量默认 48 小时（`WB_KEEPALIVE_LEAD_HOURS` 可调），拿不到到期时间时也按「该续」处理。
+- **下拉框改为自绘**（#601）：原生 `<select>` 的展开层由浏览器绘制，深色主题下会露出直角白框与系统蓝高亮；改为自绘列表，桌面与手机一致。
+- **每日活跃建会话失败后补退避**（#605）：建会话 / 取沙箱失败只用掉几百毫秒，背靠背重试会把整批尝试挤进同一个上游抖动窗口；现在按 `phase` 判断，只在这两步失败后退避（默认 5s、指数增长、30s 封顶，设置页可改）。
+- **面板闸门 fail-closed**（#606）：首帧不再闪出看板骨架，`?pwd=` 失败后也不会卡死。
+- **一次流式回复只带一个 chunk id**（#607）：客户端按 chunk id 管理流状态时，多次变化的 id 会让界面卡在「生成中」；现在整轮复用同一个 id。
+- **面板 POST 的空 body 会被排空**（#608）：按钮发 `{}` 后没读完请求体，同一条 keep-alive 连接上的下一个请求会 501，表现为偶发「无法连接反代」。
+- **Pro Only 标注改由目录 tier 表驱动**（#609）：`entitlement` 只在真撞上游 11158 时才写，而 `ready()` 早已按 `modelTiers` 在本地拦掉 PRO-only 模型，运行时那条通道几乎不再触发；现在清单直接读目录 tier，删掉冗余通道。
+- **Codex 远程压缩 v2**（#610）：长会话的压缩请求按 v2 语义处理，不再把压缩内容当普通消息透传导致上游报错。
+- **账号级并发上限 + 更稳的会话粘滞键**（#612）：两个开关默认关闭；开启后限制单个上游账号同时接几个 chat 请求，并让同一会话尽量落在同一个账号。
+- **静态 API Key 账号**（#620，Refs #572）：企业微信认证的 WorkBuddy / CodeBuddy CLI 账号可以只用 `Authorization: Bearer ck_...` 入池，免 refreshToken、强制流式上游、Key 脱敏落盘。
+- **账号行显示会员档位胶囊**（#621）：直接显示计费摘要里的套餐名（`Free` / `体验版` / 付费包名），悬停给出读取时刻。
+- **每日活跃网页会话跑完即释放**（#623）：上游对单账号活跃会话有 10 条硬上限，旧实现只建不收尾，攒满后建会话一律 429 / 10105；现在成功轮次 stop、失败轮次 stop + delete，撞上限时自动清理最旧的本网关会话。
+
+## v1.7.29
+
+七笔社区改动：四个手机端布局修复、启动时补一次更新检查、便携更新保留可执行位、API Key 的账号白名单与并发上限落盘。套件 210 个（157 Python + 53 JS）。
+
+- **手机端工具栏打卡按钮靠右**（#585）：`#accountsBody .toolbar .tb-checkin` 的 CSS 在 #498 里只进了样式表，HTML 的类名被并成了 `tb-group`，规则因此悬空；补回类名，桌面端不受影响。
+- **手机端用量统计副行每项一行、图表底边对齐**（#586）：窄屏 KPI 副行改用 `kline` / `kvi` / `ksep` 分组，`display:contents` 让每项独占一行并隐藏分隔符；数值与单位不断行，第一行三张卡改纵向 flex 让 sparkline 贴底等高。桌面端 1280 / 1100 / 900 / 700 / 641px 逐属性对照无变化。
+- **手机端账号卡出口与权重同行**（#587）：出口下拉与权重各占半行、两个 select 统一 34px 高；积分与请求铺满整行，积分格不再把列标签挤进 `credit-meta`。
+- **窄屏统计条让积分消耗独占一行**（#588）：≤860px 时把「积分消耗」与「请求成功率」对调，积分消耗占满整行，副行的估算价值不再被省略号截断。
+- **启动时补一次更新检查**（#589）：`tag` 与发布页只在内存里，重启后 24 小时窗口又锚在上一次尝试上，面板会停在「有新版本但装不了」，最长等一天。后台线程第一次 pass 带 `startup=True`，绕过 24h 窗口但仍受开关与每小时预算约束（`STARTUP_CHECK_WINDOW_SECONDS` / `STARTUP_CHECKS_PER_WINDOW = 6`），预算账本随 `update_check` 落盘；稳态仍是 24 小时一次，关掉每日检查则一个请求都不发。
+- **便携更新保留 unix 权限位**（#582）：`safe_extract()` 用裸 `open()` 写暂存文件，zip 里 755 的 `start-wb-proxy*.sh` 落盘变 644，重启那步 `Popen()` 报 EACCES 并回滚——macOS / Linux 的便携更新每次都会命中。现在按 zip 条目的 `external_attr` 还原模式，无 unix 属性不加执行位，setuid / sticky 不还原，Windows 不受影响。
+- **API Key 的账号白名单与并发上限能落盘了**（#592）：`_handle_settings_save` 重建 key 条目时漏了 `accounts` 与 `concurrency_limit`，`set_api_keys()` 读不到就回落成 `[]` / 0，面板勾选的账号保存后不生效。现在与 `realm` / `models` / `name` / `enabled` 同一规则：补丁没提到就沿用已存值。
+
+## v1.7.28
+
+面板「操作失败: no such account」的根因修复（#581）：手机号脱敏把 uid 改写成了池子里不存在的值。套件 209 个（156 Python + 53 JS）。
+
+- **uid 不再被脱敏改写**（#581）：`_redact_account_names()` 对所有字符串值跑手机号文本正则，国内号 uid `6ef20bf4-76fa-4085-b179-97517476cc1e` 里的 `179-97517476` 恰好满足 3-4-4 分组，被改成 `…b179****7476cc1e`。`/accounts` 把这个假 uid 返回给浏览器，前端点「停用账号 / 测试」时回传，`AccountPool.get()` 查不到 → 404 `no such account` → 「操作失败」。现在 `uid` / `account` / `accountId` / `id` / `file` / `path` / `machineId` / `sessionId` / `key` / `token` 这些标识符键一律原样返回；`nickname` 的脱敏不变。
+- **文本级边界收紧**：`_PHONE_IN_TEXT` 的左右边界从「不是数字」扩到「不是标识符字符」（字母 / 数字 / 下划线），日志或摘要串里嵌着的十六进制 id 不会再被切一段出来当号码。
+- **测试**：`tests/_test_nickname_privacy.py` 新增 3 项，覆盖该 uid 原样、标识符字段不被改写、同载荷里的昵称仍然脱敏。
+
+## v1.7.27
+
+账号档位改为读计费摘要（#505）：付费 / 免费不再靠猜，`is_paid_user` 有了权威来源。套件 209 个（156 Python + 53 JS）。
+
+- **档位来自计费摘要**（#505）：`/billing/meter/get-user-resource-summary` 的 `IsPaidUser` / `SubscriptionPackageName` / `IsProtectedPriceUser` / `ProTrialStatus` 解析成账号上的 `tier` 记录并落盘。国内版的详细积分路径本来就在打这个接口，直接复用同一份响应，零新增请求；国际版的 `get-user-resource` 没有档位字段，因此每账号每天最多多一次摘要请求（`TIER_TTL_SECONDS` = 24h）。
+- **失败不写结论**：401 / 非 0 code / 网络错误保留旧值与时间戳，绝不把一次失败写成「免费」；企业账号（上游语义未验证）与风控限制中的账号跳过。`tier` 按 `VOLATILE_FIELDS` 处理，导入到另一台机器时不沿用上一台的结论。
+- **接线**：`fetch_credits()` 成功后顺带刷新档位，不新开定时器；`is_paid_user` 优先取 `tier`，没有结论时回落到上一次积分快照（与旧行为一致）。面板「会员类型」旁显示包名与读取时刻，hover 给出摘要时间。
+- **测试**：新增 `tests/_test_account_tier.py`（19 项），覆盖解析、缺字段不当免费、企业 / 限制跳过、一天一次、国际版余额取档位、落盘与导入。
+
+## v1.7.26
+
+两个已确认的修复：assistant 历史里的身份句 / 品牌词指纹，以及镜像部署升级写进便携包专用文件。套件 208 个（155 Python + 53 JS）。
+
+- **11-128：assistant 历史也清洗，品牌词缩成 `DeepSeek`**（#574）：同一句 `You are an AI agent powered by DeepSeek Harness.` 放在 assistant 里 400/400/400、放在 user 里 200/200/200，说明身份句的作用域漏了 assistant；`DeepSeek Harness` 与 GUI 描述句（`this page` / `this GUI` / `this app`）连续出现时仍会命中，单独品牌词放行。现在 `sanitize_messages()` 的 identity 作用域扩到 system / developer / assistant，并在这一层把散文里的 `DeepSeek[ \t]+Harness` 缩成 `DeepSeek`。连字符 / 下划线形式（`deepseek-harness`、`deepseek_harness`、`/opt/deepseek-harness/app`）与 user / tool 内容保持原样。新增 5 项断言。
+- **镜像 / rootfs 部署升级不再写便携包专用文件**（#573）：release manifest 新增 `profiles.app`（`wb_*.py` + `dashboard.html`）。非便携包布局（清单与代码同层）的 `request.json` 会带上 `profile: "app"`，执行者据此只替换应用层：`start-wb-proxy*`、`ops/aliyun/*`、`README.md`、`LICENSE` 与 `pricing/pricing.json` 不再落到 `/app`。便携包布局（清单在包根、代码在 `wb-proxy/`）不带档位，行为不变；旧执行者忽略该字段，行为也不变。备份把本次实际管理的 `files` 记进 `backup.json`，按档位备份的目录仍能通过完整性校验并回退。新增 7 项 Python 断言与 3 项 manifest 断言。
+
+## v1.7.25
+
+四笔社区改动：DSH GUI 指纹、跨出口回退、账号表排序续行、更新备份与版本回退。套件 208 个（155 Python + 53 JS）。
+
+- **11-128：DSH GUI 描述段的句尾语序**（#579）：国内版 system 提示里的 GUI 描述段 `… the DeepSeek Harness Web GUI whose URL the runtime context names.` 紧跟 `When the user refers to "this page" …` 会命中 11-128；现在只把 A 句尾改成 `whose URL is named in the runtime context.`，品牌名与句意不变，作用域仍是 system / developer。新增 8 项断言。
+- **跨出口回退：国际版限流 → 国内版（默认关闭）**（#564）：国际版整池被限流 / 24h 窗口用满 / 整池冷却 / 空池时，把同一请求在同名国内版出口重放一次；只对两边都提供的模型、单向、显式指定 realm 的请求不回退，403 11140 不重放。设置页新增开关。新增 16 项单测。
+- **修复账号表排序把冷却 / 达限胶囊拆离账号行**（#568）：`applyTableSort()` 现在按「主行 + 紧跟的 `tr.cool-row` 续行」成组排序；表头列类型推断仍只看数据行。新增 JS 断言。
+- **保留历史版本备份 + 面板版本回退**（#571）：更新成功后保留 `updates/backup-<目标版本>/`，份数由设置控制（0–3，默认 1；0 = 不留备份、回退不可用）。设置页新增「版本回退」卡片，按本地备份恢复、不下载旧包；回退前校验完整性，回退后校验 `Server: wb-proxy/<版本>`，失败自动恢复到回退前版本。`request.json` 新增 `action`（`install` / `rollback`），便携版、外部执行者与 systemd 服务都认；旧执行者会把 rollback 当「重装该 tag」。新增 26 项 Python 断言与 1 个 JS 套件。
+
+## v1.7.24
+
+非 systemd 部署的面板一键更新通道（#561）：`install_enabled()` 不再只认 systemd unit；部署方可以用外部执行者轮询 `request.json`，网关仍只写请求、不碰自己的代码。套件 205 个（153 Python + 52 JS）。
+
+- **外部执行者通道**（#561）：`WB_UPDATE_INSTALL_ENABLED=1` + `WB_UPDATE_REQUEST_DIR` + `WB_UPDATE_EXECUTOR=external`（或目录里的 `executor.json`）即可让面板「安装更新」按钮可用；systemd 路径不变。
+- **`request.json` 扩展**：除 `tag` / `version` / `requested_at` 外，新增 `pid` / `port` / `root`，供外部执行者停进程、探针和替换目录；systemd 执行者忽略额外字段。
+- **参考执行者** `wb_update_external.py`：读取并校验 request（属主 / 权限 / 大小，读完即删），下载 release zip + `SHA256SUMS`，校验后按 manifest 备份 / 替换，停止网关，等 supervisor 拉起，探针 `/health`，失败回滚；启动时如果发现上次状态仍是 `applying` 等活跃状态且有备份，会先自动回滚（供 pre-start hook 使用）。
+- **边界**：只替换 manifest 的 `files`，`accounts/` / `usage/` 不动；应用目录不可写会在下载前报「应用目录不可写」；不替换内置 `python/`。
+- **测试**：`tests/_test_portable_update.py` 扩到 16 项，覆盖外部通道注册、`request.json` 字段、执行者读取 / 删除、无 start 重启模式、半途更新恢复。
+
+## v1.7.23
+
+Windows 便携版支持面板一键更新（#560）：不再要求 systemd unit；面板检测到新版本后，由独立 helper 下载 zip、校验 SHA256SUMS、停服、按 `release-manifest.json` 替换受管文件、重启，失败自动回滚。套件 205 个（153 Python + 52 JS）。
+
+- **便携版一键更新**（#560）：新增 `wb_update_portable.py` 与 `wb_update_apply.py`。`install_enabled()` 在便携包（存在 `release-manifest.json`、`wb_update_apply.py`、`python/python.exe`）里返回 true，面板按钮不再因缺少 systemd unit 而禁用。
+- **更新流程**：下载 `workbuddy2api-hub-vX.Y.Z.zip` 和 `SHA256SUMS` → 校验 → 解包（拒绝 `..` / 绝对路径 / 符号链接）→ 校验 manifest 与 `wb_proxy.py` 版本 → 备份受管文件 → 停止网关 → 替换 → 按原启动模式（静默 / 可见 / LAN）重启 → 轮询 `/health`；失败时恢复备份并重启旧版本。
+- **边界**：只替换 `release-manifest.json` 的 `files`，`accounts/`、`usage/` 等受保护目录不动；不替换内置 `python/` 运行时（运行时升级仍需手动覆盖）；状态写入 `updates/status.json`，面板沿用现有轮询。
+- **测试**：新增 `tests/_test_portable_update.py`（10 项），覆盖 URL / 校验、路径穿越、版本校验、备份 / 替换 / 回滚、helper 启动参数与 bridge 状态；`release/portable.txt` 已加入两个新模块，运行时契约补 `posixpath` / `signal` / `zipfile`。
+
+## v1.7.22
+
+账号任务参与独立开关（#521）：`enabled` 只管 API 取号，新增 `tasksEnabled` 控制签到、成长任务、连登管家、猫猫旅行和国际版每日活跃；停用账号可以只做任务，启用账号也可以不跑任务。套件 204 个（152 Python + 52 JS）。
+
+- **账号任务参与独立开关**（#521）：账号新增 `tasksEnabled`，`enabled` 仍控制 API 取号；调度器的签到 / 成长任务 / 连登管家 / 猫猫旅行 / 国际版活跃改为按 `task_active()` 选号，Token 保活不受影响。手动任务入口（`/tasks`、`/tasks/run`、`/tasks/streak`、`/tasks/travel`、`/accounts/daily-chat`）同样按任务开关过滤；显式指定单个 uid 时仍允许手动执行。
+- **面板「任务开 / 关」胶囊**：账号行新增任务开关，停用但参与任务的账号显示「已停用 · 任务中」；任务卡片和未活跃打卡名单按 `tasksEnabled` 过滤，旧网关没有该字段时回落到 `enabled`。
+- **默认与兼容**：旧账号没有 `tasksEnabled` 时跟随 `enabled`；停用账号默认不跑任务，需要保留任务时在账号行点一下「任务关」变成「任务开」。导出 / 导入会带上该字段。新增 `tests/_test_task_participation.py`（9 项）和 `tests/_test_task_toggle.js`，调度器与打卡名单用例同步覆盖。
+
+## v1.7.21
+
+Windows 便携包补一个可选的前台窗口启动入口：默认仍是静默（pythonw + 日志窗口），需要「关窗即停」时用新的 `start-wb-proxy-visible.bat` / `start-wb-proxy-lan-visible.bat`。套件 202 个（151 Python + 51 JS）。
+
+- **Windows 可选前台窗口启动**（#559）：新增两个薄封装脚本，设置 `WB_LAUNCH_MODE=console` 后调用原启动脚本，走现成的 `:use_python` 可见分支；默认启动方式不变。两个脚本已加入 `release/portable.txt`，并新增 2 项断言（封装脚本设置模式并调用正确目标、主脚本在 pythonw 探测前检查模式）。
+- **README 快速启动说明**：Windows 默认静默启动，关掉日志窗口不会停服务；需要「前台控制台 + 关窗即停」时用 `-visible.bat`；局域网一节同步补上。
+
+## v1.7.20
+
+三处回归修复：裸对象账号导入、流式断流错误帧与打印工具调用延迟、热力图跨天不刷新。套件 202 个（151 Python + 51 JS）。
+
+- **修复 `/accounts/import` 拒绝裸 snake_case 账号对象**（#556）：外层容器判断只认 `accessToken`，单个 cockpit 导出的 `{"uid": ..., "access_token": ...}` 在到达内层 snake_case 转换前就被 400 拒绝；补上 `access_token` 判断后，裸对象与 `{"accounts": [...]}` 的行为一致。新增 2 项断言。
+- **流式断流不再伪造 `[DONE]`**（#549）：Chat Completions 与 Responses 在读 body 中途失败时，原来补一个 `data: [DONE]` 当作正常结束，客户端会把截断的答案当成完整回复；现在先释放已缓冲文本，再发标准 error 帧（`upstream_stream_error`）并关闭连接，不再发送 `[DONE]`。新增真实网关回归 `tests/_test_stream_abort_frame.py`（6 项）。
+- **打印式工具调用即时释放**（#549）：`LeakedToolCallStreamFilter` 原来从候选前缀开始一直扣留到 EOF，长工具调用会让客户端长时间没有输出、最后一次性弹出；现在识别到调用自身的闭合标签（含全角 DSML 写法）就立即解析并发出，调用后的散文也立即释放，只有仍可能长成调用的文本留在缓冲里。新增 4 项断言。
+- **热力图按本地日刷新**（#541）：工作回溯热力图原来只在进页面时取一次 366 天序列，跨过午夜后仍停在旧的一天；现在 `since` / `until` 都钉在本地午夜（`until` 取到明天 0 点），进页面、跨天或距上次取数满 60 秒时重取，今天新产生的用量会落进今天的格子。新增 `tests/_test_dashboard_heat.js`（8 项断言）。
+
+## v1.7.19
+
+网页活跃链路成组升级、Key 级账号白名单与模型可用性过滤：本版收下社区 12 个 PR（#542–#554），把国际版每日活跃的时段、并发、重试、去重、模型回退与提示词都做成可配置项，并补上 Key 级账号限制、思考档位映射、全局提示词在线编辑、出站身份版本面板和身份句动词收口。套件 200 个（150 Python + 50 JS）。
+
+- **网页活跃可单独定时（分钟级）**（#548）：`schedule.daily_chat` 支持 1–24 个 `HH:MM` 时段，留空保持跟随签到整点；到点只触发国际版每日活跃，不再顺带跑签到 / 旅行 / 保活；设置页可逐个增删时间点，改完 30 秒内生效。
+- **网页活跃并发数（默认 1）**（#552）：新增 `daily_chat_web_concurrency`（1–10）。巡检先收集当天未活跃的国际版账号，再按上限并发执行；worker 启动带轻微错峰，调度日志加锁，多 worker 同时写不丢行。
+- **当日活跃成功后不再重复网页活跃**（#553）：`lastDailyChat` 已是今天时，`daily_chat()` 与 `daily_chat_web()` 直接返回 `skipped`，不再发桌面腿或新建网页会话；覆盖多个定时点、手动补跑与并发触发。
+- **网页活跃重试改为线性递增**（#551）：第 N 轮等待从 `base × 2^(N-1)` 改为 `base × N`，默认 3 次由 120 / 240 / 480 秒变为 120 / 240 / 360 秒，最坏占用从指数级降到线性级。
+- **网页活跃失败后按模型组合回退（默认关闭）**（#543）：按目录倍率排序（免费 → 低积分 → 高积分）逐个换模型，候选至少各试一次；建会话被业务拒绝时仍立即停止，不换模型。
+- **网页活跃随机提示词（默认关闭）**（#545）：开启后从内置 300 条短句加最多 200 条自定义提示词里随机抽一条；关闭时仍只发 `Hi`。设置页弹窗支持搜索、全选与逐条复选。
+- **API Key 支持允许账号白名单**（#544）：Key 新增 `accounts`，调度器只从名单内取号，会话粘性绑定不能绕过，`/u/<ref>` 定址到名单外账号返回 403；留空保持不限制，旧 Key 行为不变。
+- **只列出可用模型（默认关闭）**（#546）：`/v1/models` 只返回池里至少有一个账号能服务的模型；国际版 PRO ONLY 模型只有在池里存在付费账号时才列出，`ready()` 同时拒绝把它派给免费账号。
+- **思考档位映射（默认开启）**（#542）：请求的 `reasoning_effort` 不在模型目录声明的档位里时，改写为默认档位（`defaultEffort` → 固定档位 → 支持列表首项）；目录声明 `canDisableThinking: false` 时 `off` / `none` 也回落。可关闭后原样透传。
+- **全局提示词支持面板在线编辑**（#547）：`prompt.text` 优先于原有的 `prompt.file`，可选追加到 system 或替换 system，保存后即时生效，不必再往容器里挂文件；默认透传不改写。
+- **出站身份版本号可查看与修改**（#554）：面板列出 WorkBuddy 国际 / 国内、桌面内置 CLI、VSCode、CodeBuddy CLI、SDK 与 Node 的当前值和默认值，修改必须输入面板密码。国内版桌面端按 Go 版 2026-10-18 实跑对齐到 5.8.3 / CLI 2.161.0。
+- **11-128 身份句动词搭配补全**（#550）：动词表从 `powered by` / `built on` 两种扩到 7 种（`built by` / `created by` / `developed by` / `made by` / `trained by` 与省略名词的 `You are powered by …`），不引入新判据；`You are free to use tools built by …` 这类分词修饰宾语的句子保持不改写。
+
+## v1.7.18
+
+11-128 身份句指纹、积分刷新崩溃、无畏契约任务与两处面板修复：本版把「客户端自我介绍句式 + 品牌」这一类渠道指纹从单句扩展到通用句式，并收了积分批量刷新、任务清单和面板文案/布局的几处回归。套件 189 个（139 Python + 50 JS）。
+
+- **11-128：身份句 + 品牌的组合指纹改为中性句**（#533 / #537 / #539）：上游对 `You are an AI agent powered by DeepSeek Harness.`、`You are a coding agent powered by the deepseek-v4.1-flash model.`、`You are an AI assistant built on DeepSeek.` 这类「自我介绍句式 + 品牌」做大小写不敏感的连续子串匹配，命中即 400 / code 11-128；单独品牌词、改词或去掉句式都放行。现在把 system / developer 里的这类整句改写为 `You are a helpful AI assistant.`，不依赖具体品牌；user / assistant / tool 里的同名文本保持原样（用户数据）。`has_fingerprint()` 的小写快路径同步补齐，新增 12 项单测。
+- **修复全量刷新积分在默认间隔下崩溃**（#530）：`_credits_sweep()` 使用 `random.uniform(0.8, 1.2)` 做账号间拟人间隔，但 `wb_proxy.py` 漏了 `import random`，多账号点「一键刷新积分」会以 `NameError` 中断；单账号与 `WB_CREDITS_SWEEP_GAP_MS=0` 不受影响。补上导入并新增回归测试。
+- **成长任务补充「无畏契约拼豆专家」**（#525）：`WorkBuddy_Valorant` 登记为专家任务，事件固定使用真实专家 id `ex_xQHHD1u5Jkua`，不再走通用专家池；一键做任务时自动推进并领奖。
+- **修复「数据用途声明」文案反了**（#528）：`X-Private-Data` 是「数据私有」声明，`true` = 不参与模型优化、`false` = 允许参与；下拉选项与英文词条此前正好相反。已交换两处文案并加 4 项断言。
+- **修复模型清单「消费倍率」列截断**（#527）：带「免费账号不可用」胶囊的行在 1366/1440/1512 宽度下被 `nowrap` 裁掉第二枚胶囊；该列改用 `rate-cell` 类允许换行，不再依赖会被 i18n 翻译的 `data-label` 选择器。
+- **测试：聚合缓存节流用例改为统计写盘调用**（#526）：exFAT 的 mtime 粒度粗，内容相同的重写与「没有写」在文件上看不出区别；用例改为计数 `_usage_cache_write_kind` 的 snapshot 调用，断言不变。
+
 ## v1.7.17
 
 流式断流重试与出口退避、模型级 5xx 不熔断、Codex 一键配置、积分与估价口径、成长任务手动领取、免费账号不可用标注：本版把「断流被伪装成正常结束」「模型错误拖垮整池」「关限额不生效」这几条长尾问题一起收了，并补上几个新能力。套件 188 个（139 Python + 49 JS）。
@@ -479,6 +853,8 @@
 
 ## 未发布
 
+- **一键测试不再把 Clash fake-IP 误判为本机断网**：Clash Verge / sing-box 开启 fake-IP 后，所有域名都解析到 `198.18.0.0/15`，而 Python 的 `ipaddress` 把这段 IANA benchmarking 地址算作 `is_private`；连通性探针在 TCP 握手前就拒绝，面板于是弹「本机网络不通：解析到非公网地址 198.18.0.11」，可真实请求链路并不做这个检查（实测到 fake-IP 的 TCP+TLS 可达，证书正确）。现在 `_is_public_addr()` 单独放行 fake-IP 段，环回 / RFC1918 / 链路本地 / 保留段仍照旧拒绝，并新增回归用例钉住「放行后继续走 TCP 握手」。实测 fake-IP 环境下 cn/intl 探针均 ok，一键测试 5/5 账号通过。 / One-click test no longer mistakes Clash fake-IP for a dead local network: with Clash Verge / sing-box fake-IP enabled every hostname resolves into `198.18.0.0/15`, which Python's `ipaddress` classifies as `is_private` (IANA benchmarking range); the connectivity probe refused it before the TCP handshake, so the panel reported "local network down" even though real requests were fine (TCP+TLS to the fake IP is reachable with a valid certificate). `_is_public_addr()` now allowlists the fake-IP range while loopback / RFC1918 / link-local / reserved addresses stay rejected, with a regression test asserting the address proceeds to the TCP handshake. Verified under fake-IP: both cn/intl probes ok and 5/5 accounts passed the one-click test.
+- **面板密码加密异常明确报错**（#658）：解释器缺少 `hashlib.pbkdf2_hmac` 支持时（如 Windows SAC 拦截便携运行时 DLL），不再将计算异常吞成「密码错误」返回 401，而是明确返回 500 与环境排查指引；启动自检与 `/health`、`/panel/status` 暴露 `crypto_ok` 状态并在面板提示。新增 `tests/_test_panel_crypto_unavailable.py`。
 - **智能体一键配置 (Agent Config)**：参照 EasyCLIProxyAPI 的 agents 机制，支持对本机 Claude Code、Codex CLI、OpenCode、DSH、Crush 客户端的一键检测、配置写入与安全备份还原；内置纯标准库文本级 YAML/TOML/JSON 编辑器与两阶段事务回滚保护。
 - 新增 `tests/_test_agents.py`（26 项 / 97 断言）：覆盖 YAML/TOML/dotenv/JSON 编辑器、客户端注册表、两阶段原子回滚、备份还原与网关 handlers 端到端测试。
 - 新增 `tests/_test_agent_ui.js`（18 项断言）：把看板脚本载入 DOM 桩后直接调用真实的 `applyAgent()` / `restoreAgent()` / `loadAgents()`，断言实际发出的请求体与渲染结果，钉住请求字段名漂移与未声明标识符这两类只在浏览器里暴露的缺陷。

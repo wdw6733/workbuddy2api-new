@@ -157,7 +157,7 @@ class ScriptedUpstream(object):
         return item
 
 
-PAYLOAD = {"model": "deepseek-v4.1-flash",
+PAYLOAD = {"model": "deepseek-v4.1-flash-sg",
            "messages": [{"role": "user", "content": "hi"}]}
 
 
@@ -185,11 +185,11 @@ class Restricted403DispatchTests(unittest.TestCase):
         self.old_rotate = P.RESTRICTED_403_ROTATE_MAX
         self.old_min = P.RESTRICTION_WAVE_MIN
         self.old_window = P.RESTRICTION_WAVE_WINDOW
-        self.old_hold = P.RESTRICTION_HOLD_SECONDS
         P.RESTRICTED_403_ROTATE_MAX = 0
         P.RESTRICTION_WAVE_MIN = 2
         P.RESTRICTION_WAVE_WINDOW = 900.0
-        P.RESTRICTION_HOLD_SECONDS = 1800.0
+        P.wb_settings.set_restriction_hold_seconds(
+            P.ACCOUNTS_DIR, P.wb_settings.DEFAULT_RESTRICTION_HOLD_SECONDS)
         P.reset_restriction_state()
 
     def tearDown(self):
@@ -197,7 +197,6 @@ class Restricted403DispatchTests(unittest.TestCase):
         P.RESTRICTED_403_ROTATE_MAX = self.old_rotate
         P.RESTRICTION_WAVE_MIN = self.old_min
         P.RESTRICTION_WAVE_WINDOW = self.old_window
-        P.RESTRICTION_HOLD_SECONDS = self.old_hold
         P.reset_restriction_state()
 
     def _run(self, accounts, script):
@@ -285,7 +284,7 @@ class Restricted403DispatchTests(unittest.TestCase):
             wb_accounts.urlopen = real_urlopen
 
     def test_hold_switch_can_disable_the_pause(self):
-        P.RESTRICTION_HOLD_SECONDS = 0.0
+        P.wb_settings.set_restriction_hold_seconds(P.ACCOUNTS_DIR, 0)
         first = make_account("a1")
         second = make_account("b1")
         P.POOL = StubPool([first, second])
@@ -323,6 +322,67 @@ class Restricted403DispatchTests(unittest.TestCase):
         self.assertIsNone(raised)
         self.assertEqual(resp[1].uid, "f2")
         self.assertEqual(flaky.fails, 1)
+
+
+class ChannelGuardAttributionTests(unittest.TestCase):
+    """400 透传也要写明用了哪个账号、哪个代理出口（#743）。
+
+    400 在 open_upstream() 里直接 raise（不轮转、不改正文），旧实现因此
+    绕过了函数末尾的 account_uid 附加，错误行只能记成 unattributed。
+    """
+
+    def setUp(self):
+        self._old_pool = P.POOL
+        self._old_rotate = P.RESTRICTED_403_ROTATE_MAX
+        P.RESTRICTED_403_ROTATE_MAX = 0
+
+    def tearDown(self):
+        P.POOL = self._old_pool
+        P.RESTRICTED_403_ROTATE_MAX = self._old_rotate
+
+    def _run(self, scripts):
+        account = wb_accounts.Account({
+            "uid": "400-user-1", "accessToken": "t-800",
+            "realm": "intl", "proxy": "http://user:pass@127.0.0.1:17913",
+            "proxySlot": "slot-8",
+        })
+        P.POOL = StubPool([account])
+        upstream = ScriptedUpstream(scripts)
+        real_urlopen = wb_accounts.urlopen
+        wb_accounts.urlopen = upstream
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                P.open_upstream(dict(PAYLOAD), target_realm="intl")
+        finally:
+            wb_accounts.urlopen = real_urlopen
+        return ctx.exception, upstream
+
+    def test_400_carries_account_and_egress(self):
+        body = json.dumps({
+            "code": "11-128",
+            "msg": "Illegal API invocation from an unapproved channel",
+        }).encode("utf-8")
+        raised, upstream = self._run([http_error(400, body)])
+        self.assertIsInstance(raised, urllib.error.HTTPError)
+        self.assertEqual(len(upstream.calls), 1)
+        self.assertEqual(getattr(raised, "account_uid", None), "400-user-1")
+        self.assertEqual(getattr(raised, "proxy_slot", None), "slot-8")
+        self.assertEqual(getattr(raised, "proxy_exit", None), "127.0.0.1:17913")
+
+    def test_hundreds_of_400s_keep_the_attribution(self):
+        body = b'{"code":11-128,"msg":"Illegal API invocation"}'
+        for _ in range(22):
+            raised, _upstream = self._run([http_error(400, body)])
+            self.assertEqual(getattr(raised, "account_uid", None), "400-user-1")
+            self.assertEqual(getattr(raised, "proxy_slot", None), "slot-8")
+            self.assertEqual(getattr(raised, "proxy_exit", None),
+                             "127.0.0.1:17913")
+
+    def test_egress_exit_never_leaks_proxy_credentials(self):
+        self.assertEqual(P.egress_exit(""), "direct")
+        self.assertEqual(P.egress_exit("http://user:secret@10.0.0.9:8080"),
+                         "10.0.0.9:8080")
+        self.assertEqual(P.egress_exit("10.0.0.9:8080"), "10.0.0.9:8080")
 
 
 class IdentityOnRetryTests(unittest.TestCase):
@@ -395,7 +455,7 @@ class IdentityOnRetryTests(unittest.TestCase):
                             second["x-conversation-request-id"])
         self.assertNotIn("x-b3-parentspanid", first)
         self.assertEqual(first["user-agent"],
-                         "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0")
+                         "WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0")
         # 桌面端的请求体与浏览器头都保持原样（不 gzip）。
         self.assertNotIn("content-encoding", first)
         self.assertNotEqual(upstream.calls[0].data[:2], b"\x1f\x8b")

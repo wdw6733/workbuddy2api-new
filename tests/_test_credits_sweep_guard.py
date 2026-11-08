@@ -168,6 +168,16 @@ class SweepTests(unittest.TestCase):
             self.assertGreaterEqual(d, 0.11, "间隔应落在 120ms 附近，实际 %r" % (delays,))
             self.assertLessEqual(d, 0.13, "间隔应落在 120ms 附近，实际 %r" % (delays,))
 
+    def test_paced_gap_uses_random_module(self):
+        """默认 800~1200ms 的抖动走 random.uniform；漏 import 会在真实刷积分时炸掉。"""
+        os.environ[GAP_ENV] = "800-1200"
+        delays = []
+        with mock.patch.object(wb_proxy.time, "sleep", delays.append):
+            wb_proxy._credits_sweep([FakeAccount("u1"), FakeAccount("u2")], paced=True)
+        self.assertEqual(len(delays), 1)
+        self.assertGreaterEqual(delays[0], 0.8)
+        self.assertLessEqual(delays[0], 1.2)
+
     def test_zero_gap_env_keeps_it_fast(self):
         os.environ[GAP_ENV] = "0"
         t0 = time.time()

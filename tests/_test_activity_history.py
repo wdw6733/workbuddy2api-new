@@ -304,6 +304,10 @@ class RecordingTests(IsolatedCase):
         self.assertEqual(rows[0]["realm"], "intl")
         self.assertTrue(rows[0]["ok"])
 
+        # The same account on a later day: a success today must not hide the
+        # next day's failure row.
+        account.last_daily_chat = None
+
         def boom(req, **kw):
             raise RuntimeError("upstream down")
         with mock.patch.object(wb_accounts, "urlopen", boom):

@@ -58,8 +58,9 @@ assert.ok(names(mainTabs[1]).includes('accounts'), 'accounts 必须在主标签�
 
 // 切到账号页要顺手把签到记录拉起来；开关关掉（默认）时账号区就在
 // 「网关与账号」页，切到网关页同样要拉。
-assert.ok(/if\(tab === 'accounts' \|\| \(!_accountsSeparateTab && tab === 'gateway'\)\)\{ loadActivityBoard\(\); \}/.test(script),
-  '切到账号页（或合并后的网关页）应触发 loadActivityBoard');
+assert.ok(script.includes("if(tab === 'accounts' || (!_accountsSeparateTab && tab === 'overview')){ loadActivityBoard(); }")
+  || script.includes("if(tab === 'accounts' || (!_accountsSeparateTab && tab === 'gateway')){ loadActivityBoard(); }"),
+  '切到账号页（或合并后的网关/总览页）应触发 loadActivityBoard');
 
 // 签到记录区块的骨架
 for(const id of ['activityRange', 'activityTask', 'activityResult', 'activityAccount',
@@ -118,8 +119,8 @@ assert.ok(/data\.accounts_separate_tab === true/.test(script),
 assert.ok(/postJSON\('\/settings\/save', \{accounts_separate_tab: value\}\)/.test(script),
   '保存应只 patch accounts_separate_tab 一个键');
 // 合并之后「账号」的书签不能停在内容已经不在了的空页上
-assert.ok(/if\(tab === 'accounts' && !_accountsSeparateTab\) tab = 'gateway';/.test(script),
-  '合并模式下 ?tab=accounts 应退回「网关与账号」页');
+assert.ok(/if\(tab === 'accounts' && !_accountsSeparateTab\) tab = window\.__NEXT_UI__ \? 'overview' : 'gateway';/.test(script),
+  '合并模式下 ?tab=accounts 应退回「网关与账号」/总览页');
 
 /* ---- 1c. 一键切换所有出站身份 --------------------------------------- */
 
@@ -238,7 +239,7 @@ function check(label, ok, detail){
   const h = listHtml();
   check('时间按落盘的墙上时间显示', h.includes('10-09 21:03'), h.slice(0, 160));
   check('昵称进账号列', h.includes('老王'));
-  check('昵称标记为不翻译', h.includes('<span data-no-i18n>老王</span>'));
+  check('昵称标记为不翻译', h.includes('data-no-i18n') && h.includes('>老王</span>'));
   check('没有昵称时回落到 uid 前 8 位', h.includes('uid-abcd'), h.slice(0, 400));
   check('区域列', h.includes('国内版') && h.includes('国际版'));
   check('任务列', h.includes('国内版签到') && h.includes('国际版每日活跃'));
@@ -300,6 +301,8 @@ function check(label, ok, detail){
     REQUESTS.some(u => u.indexOf('/activity/history') === 0), JSON.stringify(REQUESTS));
 
   // 2j. 开关：区块在两页之间搬家，页签名与「账号」页签的显隐跟着走。
+  // 此段验证用户显式选择经典布局时的文案；默认控制台另行验证。
+  document.documentElement.removeAttribute('data-console-layout');
   // 假 DOM 不把 HTML 解析成树（getElementById 是惰性建元素），所以这里按**运行时**
   // 的真实结构自己搭最小场景——initPageNav() 会把页面内容整体包进 .page-nav-body，
   // 两个锚点因此都不是页面 div 的直接子节点。踩过的坑：直接对页面 div 调
@@ -361,6 +364,12 @@ function check(label, ok, detail){
   check('拆开后网关页签改回「网关」', el('navGatewayLabel').textContent === '网关',
     el('navGatewayLabel').textContent);
   check('拆开后开关读回来是开', api.accountsSeparateTab() === true);
+
+  document.documentElement.setAttribute('data-console-layout', 'on');
+  api.applyAccountsTabLayout(false);
+  check('控制台布局保持运行概览文案', el('navGatewayLabel').textContent === '运行概览');
+  check('控制台布局仍将账号区合并到网关页', moved.every(s => kids(gatewayBody).includes(s)));
+
 
   // 2k. 一键切换所有出站身份：按钮显示当前身分，点一下切到下一个并提交全量
   window.ACCOUNTS = [{uid: 'u1', product: 'workbuddy'}, {uid: 'u2', product: 'workbuddy'}];

@@ -32,6 +32,11 @@ if not "%KEY%"=="" set "PYARGS=%PYARGS% --api-key %KEY%"
 
 if not exist "%SCRIPT%" goto no_script
 
+rem ---- explicit visible-console mode ----
+rem The -visible.bat wrapper sets WB_LAUNCH_MODE=console; the default
+rem stays silent (pythonw + console_tail.py).
+if /i "%WB_LAUNCH_MODE%"=="console" goto use_python
+
 rem ---- prefer pythonw (GUI subsystem: no console window) ----
 if exist "%HERE%python\pythonw.exe" goto pyw_bundled
 if exist "%HERE%.venv\Scripts\pythonw.exe" goto pyw_venv

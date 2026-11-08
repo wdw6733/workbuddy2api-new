@@ -96,6 +96,7 @@ class FakeAccount(object):
     def __init__(self, realm="cn"):
         self.uid = "fake-uid-1234"
         self.realm = realm
+        self.tasks_enabled = True
         self.restricted_until = 0.0
         self.expires_at = 0.0
         self.last_error = ""
@@ -103,6 +104,9 @@ class FakeAccount(object):
         self.reports = 0
         self.daily = 0
         self.refreshes = 0
+
+    def task_active(self):
+        return self.tasks_enabled
 
     def can_checkin(self):
         return True
@@ -161,6 +165,37 @@ class TaskGatingTests(unittest.TestCase):
             scheduler._run_cycle("test", force=force)
         return seen
 
+    def test_task_flag_off_skips_tasks_but_keeps_keepalive(self):
+        with tempfile.TemporaryDirectory(prefix="sched-task-") as directory:
+            wb_settings.set_schedule_hours(directory, {
+                "checkin": [10, 20], "travel": [10, 20],
+                "keepalive": [10], "cat": [1],
+            })
+            scheduler = wb_scheduler.Scheduler(StubPool(directory))
+            account = FakeAccount()
+            account.tasks_enabled = False
+            account.expires_at = time.time() + 60
+            scheduler.pool.accounts = [account]
+
+            seen = self._run_at(scheduler, account, 10)
+            self.assertEqual((account.checkins, account.reports), (0, 0))
+            self.assertEqual((seen["travel"], seen["bonus"], seen["cat"]),
+                             (0, 0, 0))
+            self.assertEqual(account.refreshes, 1)
+
+    def test_task_flag_on_still_runs_checkin(self):
+        with tempfile.TemporaryDirectory(prefix="sched-task-") as directory:
+            wb_settings.set_schedule_hours(directory, {
+                "checkin": [10, 20], "travel": [10, 20],
+                "keepalive": [12], "cat": [1],
+            })
+            scheduler = wb_scheduler.Scheduler(StubPool(directory))
+            account = FakeAccount()
+            scheduler.pool.accounts = [account]
+
+            self._run_at(scheduler, account, 10)
+            self.assertEqual((account.checkins, account.reports), (1, 1))
+
     def test_cat_hour_does_not_run_checkin_or_travel(self):
         with tempfile.TemporaryDirectory(prefix="sched-gate-") as directory:
             wb_settings.set_schedule_hours(directory, {
@@ -202,6 +237,42 @@ class TaskGatingTests(unittest.TestCase):
             seen = self._run_at(scheduler, account, 3, force=True)
             self.assertEqual((account.checkins, account.reports), (1, 1))
             self.assertEqual((seen["travel"], seen["bonus"], seen["cat"]), (1, 1, 1))
+
+
+class LogRoutingTests(unittest.TestCase):
+    """Scheduler logs must land in the wb_proxy that is actually running.
+
+    Started as `python wb_proxy.py`, the main module is `__main__`; a plain
+    `import wb_proxy` loads a second copy whose LOG_STORE is None, so every
+    scheduler line was dropped. Measured on a real install: 64k log rows and
+    zero `[调度器]` entries, while the startup banner had 8.
+    """
+
+    def test_log_goes_to_the_running_main_module(self):
+        recorded = []
+
+        class FakeMain(object):
+            LOG_BUFFER = []
+
+            @staticmethod
+            def add_log_entry(text, tag=None):
+                recorded.append((text, tag))
+
+        fake_main = FakeMain()
+        with mock.patch.dict(sys.modules, {"__main__": fake_main}):
+            self.assertIs(wb_scheduler._proxy_module(), fake_main)
+            with tempfile.TemporaryDirectory(prefix="sched-log-") as directory:
+                scheduler = wb_scheduler.Scheduler(StubPool(directory))
+                scheduler.log("巡检开始")
+
+        self.assertEqual(recorded, [("[调度器] 巡检开始", "scheduler")])
+
+    def test_log_falls_back_when_main_module_is_not_the_proxy(self):
+        # Under `python -m pytest` or an import from another host, `__main__`
+        # is the test runner: it must not be mistaken for the gateway.
+        cached = sys.modules.get("wb_proxy") or wb_scheduler._proxy_module()
+        with mock.patch.dict(sys.modules, {"__main__": object()}):
+            self.assertIs(wb_scheduler._proxy_module(), cached)
 
 
 if __name__ == "__main__":

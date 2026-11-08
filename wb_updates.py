@@ -9,7 +9,9 @@
 三条硬约束：
 
 1. **默认关闭**。每日检查是 operator 显式打开的偏好；缺键、false 都是关闭，
-   关闭时后台一个请求都不发。
+   关闭时后台一个请求都不发。打开后，进程每次启动补问一次（tag 与发布页不落盘，
+   重启不补就问不回来），一小时最多补 6 次以免崩溃重启循环刷配额，稳态下仍是
+   每 24 小时一次。
 2. **失败不致命**。网络超时、HTTP 错误、JSON 坏了都只记一行短原因，网关照常
    服务；后台检查永远不挡请求路径。
 3. **只留安全运维字段**。落盘的只有「上次尝试时间 / 上次成功时间 / 见过的版本
@@ -50,13 +52,23 @@ TAG_RE = re.compile(r"/releases/tag/([^/?#]+)")
 # （模块头第 3 条）。
 TOKEN_ENV = "GITHUB_TOKEN"
 USER_AGENT = "wb2api-hub-update-check"
-REQUEST_TIMEOUT = 5
+# 回退路径是 302 跳转 + 对象存储下载，代理出口下实测 4.2~10s；5s 会把
+# 本可成功的回退请求掐掉，两条路径全挂才报「更新检查失败」。10s 留足
+# 余量又不至于让坏响应挂住面板（检查本身有 24h 节流，失败下个窗口重试）。
+REQUEST_TIMEOUT = 10
 # 一份 releases 文档几十 KB；给足余量但设上限，坏响应不能把内存拉满。
 MAX_BODY = 2 * 1024 * 1024
 
 # 每日检查的节流窗口。约 24 小时：重启不会让检查变得频繁，也不会因为一次
 # 失败就整天不再试。
 SCHEDULED_INTERVAL_SECONDS = 24 * 3600
+# 启动补检查的预算：一小时内最多补几次。重启是低频事件，正常的「点检查 → 点安装
+# → 执行者重启」一次只花掉一个额度，所以永远不会被自己的保护挡住；而崩溃重启
+# 循环会在用光预算后停手，不至于把匿名 API 配额（60 次/小时/出口 IP）刷穿。
+# 用预算而不是「最小间隔」，是因为保护要挡的场景（几秒一次的重启）和要放行的
+# 场景（检查到重启只隔十几秒）在时间尺度上完全重叠。
+STARTUP_CHECK_WINDOW_SECONDS = 3600.0
+STARTUP_CHECKS_PER_WINDOW = 6
 # 启动后先等一会儿再花掉这个请求，让监听端口和账号池先就绪。
 FIRST_DELAY_SECONDS = 30
 # 后台线程醒来的间隔。真正的节流靠 due() 判断，这里只决定「多久看一眼」。
@@ -141,7 +153,24 @@ def describe_failure(exc):
     return type(exc).__name__
 
 
-def fetch_releases(url=RELEASES_URL, timeout=REQUEST_TIMEOUT):
+def _opener(proxy=""):
+    """A direct opener, or one pinned to the configured proxy slot."""
+    proxy = str(proxy or "").strip()
+    if not proxy:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+
+
+def _open(request, timeout, proxy=""):
+    """Keep the no-proxy path patchable by the existing test contract."""
+    proxy = str(proxy or "").strip()
+    if not proxy:
+        return urllib.request.urlopen(request, timeout=timeout)
+    return _opener(proxy).open(request, timeout=timeout)
+
+
+def fetch_releases(url=RELEASES_URL, timeout=REQUEST_TIMEOUT, proxy=""):
     """releases 文档的原始 JSON 文本；任何失败都抛异常给调用方。
 
     API 那一跳走的是**匿名**配额：60 次/小时/出口 IP。国内用户普遍从共享代理
@@ -150,15 +179,15 @@ def fetch_releases(url=RELEASES_URL, timeout=REQUEST_TIMEOUT):
     拿回来；那边也失败才抛异常，抛的是 API 的原因，它才是主路径。
     """
     try:
-        return _fetch_api(url, timeout)
+        return _fetch_api(url, timeout, proxy=proxy)
     except Exception as api_error:
         try:
-            return json.dumps([fetch_latest_release(timeout)])
+            return json.dumps([fetch_latest_release(timeout, proxy=proxy)])
         except Exception:
             raise api_error
 
 
-def _fetch_api(url, timeout):
+def _fetch_api(url, timeout, proxy=""):
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/vnd.github+json",
@@ -167,11 +196,11 @@ def _fetch_api(url, timeout):
     if token:
         headers["Authorization"] = "Bearer " + token
     request = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with _open(request, timeout, proxy) as response:
         return response.read(MAX_BODY).decode("utf-8", "replace")
 
 
-def fetch_latest_release(timeout=REQUEST_TIMEOUT):
+def fetch_latest_release(timeout=REQUEST_TIMEOUT, proxy=""):
     """网页端点上的最新稳定版，返回一条 releases 条目。
 
     releases/latest 会 302 到 /releases/tag/<tag>；urlopen 跟完重定向后
@@ -180,7 +209,7 @@ def fetch_latest_release(timeout=REQUEST_TIMEOUT):
     """
     request = urllib.request.Request(LATEST_RELEASE_URL,
                                      headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with _open(request, timeout, proxy) as response:
         final = response.geturl()
     match = TAG_RE.search(final or "")
     if not match:
@@ -212,7 +241,7 @@ class UpdateChecker(threading.Thread):
         self.current_version = str(current_version or "").strip()
         self.settings_dir = settings_dir
         # 注入点：测试给一个假的 fetcher，就不必碰网络。
-        self._fetch = fetcher or fetch_releases
+        self._fetch = fetcher
         self._log = log
         self._first_delay = max(0.0, float(first_delay))
         self._poll_seconds = max(1.0, float(poll_seconds))
@@ -224,6 +253,7 @@ class UpdateChecker(threading.Thread):
         self._last_error = ""
         self._last_attempt = 0.0
         self._last_success = 0.0
+        self._startup_checks = []
         self._load_state()
 
     # ---- 状态 -----------------------------------------------------------
@@ -235,6 +265,7 @@ class UpdateChecker(threading.Thread):
             return
         self._last_attempt = state.get("last_attempt") or 0.0
         self._last_success = state.get("last_success") or 0.0
+        self._startup_checks = [float(stamp) for stamp in state.get("startup_checks") or []]
         version = state.get("latest_version") or ""
         if version:
             self._latest = {
@@ -265,6 +296,35 @@ class UpdateChecker(threading.Thread):
             return True
         return (now - self._last_attempt) >= SCHEDULED_INTERVAL_SECONDS
 
+    def startup_due(self, now=None):
+        """启动后那次补检查是否该跑。
+
+        与 `due()` 的 24 小时窗口无关——重启时窗口往往还没放行，而 tag / 发布页
+        只在内存里，不补这一次，面板就会显示「有新版本」却要求先手动检查。
+
+        保护用**预算**：一小时内最多补 `STARTUP_CHECKS_PER_WINDOW` 次。这样正常
+        流程（点检查 → 点安装 → 执行者重启，全程十几秒）永远不会被挡住，而崩溃
+        重启循环用光额度后停手。开关仍然优先：每日检查关掉时启动也不发请求。
+        """
+        if not self.enabled():
+            return False
+        now = time.time() if now is None else float(now)
+        if not self._last_attempt:
+            return True
+        window = now - STARTUP_CHECK_WINDOW_SECONDS
+        spent = len([stamp for stamp in self._startup_checks if stamp > window])
+        return spent < STARTUP_CHECKS_PER_WINDOW
+
+    def _note_startup_check(self):
+        """把这次启动补检查记进预算。记账失败不影响这次检查本身。"""
+        stamp = time.time()
+        self._startup_checks = sorted(self._startup_checks + [stamp])[
+            -wb_settings.STARTUP_CHECK_STAMPS_KEPT:]
+        try:
+            wb_settings.record_startup_check(self.settings_dir, at=stamp)
+        except Exception:
+            pass
+
     def status(self):
         picked = self._latest or {}
         latest = picked.get("version") or ""
@@ -291,12 +351,13 @@ class UpdateChecker(threading.Thread):
             pass
 
     # ---- 检查 -----------------------------------------------------------
-    def check(self, manual=False):
+    def check(self, manual=False, startup=False):
         """跑一次发现，返回状态字典。
 
-        `manual=True` 绕过开关和 24 小时窗口：操作员点了「立即检查」就必须真的
-        去问一次。`manual=False` 是后台路径，关闭或没到点就直接返回，一个请求
-        都不发。
+        `manual=True` 绕过开关和两个窗口：操作员点了「立即检查」就必须真的去问
+        一次。`startup=True` 是进程起来后的第一次（绕过 24 小时窗口，但仍受开关
+        与每小时预算约束）。其余是稳态的后台路径：关闭或没到点就直接返回，一个
+        请求都不发。
 
         同步执行，耗时由 fetcher 的超时封顶；它不持有任何请求路径要等的锁。
         """
@@ -305,7 +366,12 @@ class UpdateChecker(threading.Thread):
             if not self.enabled():
                 status["skipped"] = "disabled"
                 return status
-            if not self.due():
+            if startup:
+                if not self.startup_due():
+                    status["skipped"] = "startup budget spent"
+                    return status
+                self._note_startup_check()
+            elif not self.due():
                 status["skipped"] = "not due yet"
                 return status
         with self._lock:
@@ -324,7 +390,20 @@ class UpdateChecker(threading.Thread):
         self._last_attempt = time.time()
         self._last_error = ""
         try:
-            document = json.loads(self._fetch(RELEASES_URL, REQUEST_TIMEOUT))
+            if self._fetch is not None:
+                document = json.loads(self._fetch(RELEASES_URL, REQUEST_TIMEOUT))
+            else:
+                proxy = ""
+                try:
+                    slot_id = wb_settings.update_check_proxy_slot(self.settings_dir)
+                    if slot_id:
+                        slot = wb_settings.find_proxy_slot(self.settings_dir, slot_id)
+                        if slot and slot.get("enabled", True):
+                            proxy = slot.get("url") or ""
+                except Exception:
+                    proxy = ""
+                document = json.loads(fetch_releases(
+                    RELEASES_URL, REQUEST_TIMEOUT, proxy=proxy))
             if not isinstance(document, list):
                 raise ValueError("releases document is not a list")
             picked = pick_latest(document, self.current_version)
@@ -361,9 +440,12 @@ class UpdateChecker(threading.Thread):
         # 先让监听端口和账号池就绪，再花掉第一个请求。
         if self._stop_event.wait(self._first_delay):
             return
+        # 第一次是启动补检查：窗口没放行也问一次，否则重启后拿不到可安装的 tag。
+        startup = True
         while not self._stop_event.is_set():
             try:
-                self.check(manual=False)
+                self.check(manual=False, startup=startup)
             except Exception as exc:
                 self.log("更新检查异常：%s" % describe_failure(exc))
+            startup = False
             self._park(self._poll_seconds)

@@ -7,9 +7,9 @@
      - X-Product: SaaS
      - X-Agent-Intent: craft、X-Agent-Purpose: conversation、X-Agent-Type: main
      - 国际版端点: www.workbuddy.ai
-       实测 5.8.4（2026-10-16 mitmproxy 抓包，账号 uid 已脱敏）:
-         X-IDE-Version: 5.8.4
-         User-Agent: WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0
+       实测 5.9.4（本机桌面客户端 5.9.4 日志 + app.asar 解包，账号 uid 已脱敏）:
+         X-IDE-Version: 5.9.4
+         User-Agent: WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0
      - 国内版端点: copilot.tencent.com（无对应抓包，维持 5.5.6 与原 UA）
 
   2. 官方 VSCode 扩展 (vscode / vsc):
@@ -65,19 +65,24 @@ import threading
 import time
 import uuid
 
-# 5.8.4 实测（国际版桌面客户端抓包）: 对话请求的版本号与 UA。
-# UA 末段 CLI/2.161.0 是客户端内置 CLI 的版本，不是桌面端自己的版本。
-DESKTOP_VERSION_INTL = "5.8.4"
+# 5.9.4 实测（本机国际版桌面客户端 5.9.4 的日志/解包）: 对话请求的版本号与 UA。
+# UA 末段 CLI/2.165.0 是客户端内置 CLI 的版本（cli/package.json），不是桌面端
+# 自己的版本。客户端日志原样记录：
+#   user-agent: WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0
+DESKTOP_VERSION_INTL = "5.9.4"
 # 对话请求由客户端内置 CLI 子进程发出，该进程带 CLIENT_INFO_IDE_TYPE=WorkBuddy
 # （sidecar-manager.js 硬编码），buildUserAgent 里 platform 段取它、application
 # 段取 product.json 的 applicationName（国际版为 workbuddy-ai），所以首段是大写
 # WorkBuddy、次段是小写 workbuddy-ai。
 # 注意 Electron 主进程自己发的旁路请求（msg-center / conversations）UA 是
 # workbuddy-ai/... workbuddy-ai/...，两者不是同一条链路，别照抄错。
-DESKTOP_UA_INTL = "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0"
-# 国内版客户端没有对应抓包，维持原值，不凭猜测改。
-DESKTOP_VERSION_CN = "5.5.6"
-DESKTOP_UA_CN = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
+DESKTOP_UA_INTL = "WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0"
+# 国内版桌面端：2026-10-18 两区桌面端实跑（Go 版抓包记录）为 5.8.3、
+# 内置 CLI 2.161.0；第二段按国内版是 WorkBuddy（国际版是 workbuddy-ai）。
+# 本机只装了国际版 5.9.4，CN 的 5.9.4 版本号未能本地复核，沿用旧值。
+DESKTOP_VERSION_CN = "5.8.3"
+DESKTOP_UA_CN = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
+DESKTOP_CLI_CN = "2.161.0"
 
 #: 官方 CodeBuddy CLI 的版本号：npm 包 @tencent-ai/codebuddy-code 的 package
 #: version。product.json 没有覆盖 platformVersion / productVersion，所以
@@ -114,17 +119,23 @@ def _identity_arch():
         machine, machine or "x64")
 
 
+def desktop_chat_compat_enabled():
+    """Opt in to desktop chat headers without changing billing or other products."""
+    return os.environ.get("WB_DESKTOP_CHAT_COMPAT", "").strip() == "1"
+
+
 def cli_stainless_headers():
     """官方 OpenAI Node SDK 6.25.0 的 x-stainless-* 指纹头。"""
     return {
         "x-stainless-lang": "js",
-        "x-stainless-package-version": "6.25.0",
+        "x-stainless-package-version": sdk_version(),
         "x-stainless-os": _identity_os(),
         "x-stainless-arch": _identity_arch(),
         "x-stainless-runtime": "node",
         "x-stainless-runtime-version": (
-            str(os.environ.get("WB_IDENTITY_NODE_VERSION") or "").strip()
-            or "v22.21.1"),
+            str(_VERSION_OVERRIDES.get("node") or "").strip()
+            or str(os.environ.get("WB_IDENTITY_NODE_VERSION") or "").strip()
+            or node_version()),
         "x-stainless-retry-count": "0",
         "x-stainless-timeout": "1200",
     }
@@ -161,13 +172,14 @@ def vscode_ide_version():
 
     可用 WB_VSCODE_IDE_VERSION 覆盖，跟你的实际宿主 IDE 版本对齐。
     """
-    return (str(os.environ.get("WB_VSCODE_IDE_VERSION") or "").strip()
+    return (str(_VERSION_OVERRIDES.get("vscode_ide") or "").strip()
+            or str(os.environ.get("WB_VSCODE_IDE_VERSION") or "").strip()
             or VSCODE_IDE_VERSION)
 
 
 def vscode_ua():
     return "%s/%s %s/%s" % (VSCODE_PLATFORM, vscode_ide_version(),
-                            VSCODE_PRODUCT_NAME, VSCODE_PRODUCT_VERSION)
+                            VSCODE_PRODUCT_NAME, vscode_product_version())
 # 官方 HttpEnvRouteInterceptor：developerMode 关闭时固定 production。
 VSCODE_ENV_ID = "production"
 
@@ -175,6 +187,73 @@ VSCODE_ENV_ID = "production"
 # 免得外部脚本按老名字取值时断掉。
 DEFAULT_WORKBUDDY_IDE_VERSION = VSCODE_IDE_VERSION
 DEFAULT_WORKBUDDY_PRODUCT_VERSION = VSCODE_PRODUCT_VERSION
+
+#: 默认版本号：抓包 / 官方包解包核对过的值。面板上「出站身份版本号」列出的
+#: 就是这一组；只有这组值有对应的头族与请求体配套。
+_VERSION_DEFAULTS = {
+    "desktop_intl": DESKTOP_VERSION_INTL,
+    "desktop_cn": DESKTOP_VERSION_CN,
+    "desktop_cli": "2.165.0",
+    "vscode_product": VSCODE_PRODUCT_VERSION,
+    "vscode_ide": VSCODE_IDE_VERSION,
+    "cli": DEFAULT_IDE_VERSION,
+    "sdk": "6.25.0",
+    "node": "v22.21.1",
+}
+#: 面板改过的版本号（settings.json 的 identity_versions）。只改发出去的字符串，
+#: 不改头族、请求体与 ID 形态——那些是每个版本单独核对过的。
+_VERSION_OVERRIDES = {}
+
+
+def default_versions():
+    """A copy of the verified default version numbers."""
+    return dict(_VERSION_DEFAULTS)
+
+
+def configure_versions(overrides):
+    """Apply panel-provided version overrides (empty/unknown keys are ignored)."""
+    global _VERSION_OVERRIDES
+    clean = {}
+    for key in _VERSION_DEFAULTS:
+        value = str((overrides or {}).get(key) or "").strip()
+        if value:
+            clean[key] = value
+    _VERSION_OVERRIDES = clean
+    return dict(clean)
+
+
+def _version(key):
+    return str(_VERSION_OVERRIDES.get(key) or _VERSION_DEFAULTS[key])
+
+
+def desktop_version(realm):
+    return _version("desktop_cn" if realm == "cn" else "desktop_intl")
+
+
+def desktop_ua(realm):
+    app = desktop_version(realm)
+    if realm == "cn" and "desktop_cli" not in _VERSION_OVERRIDES:
+        cli = DESKTOP_CLI_CN
+    else:
+        cli = _version("desktop_cli")
+    product = "WorkBuddy" if realm == "cn" else "workbuddy-ai"
+    return "WorkBuddy/%s %s/%s CLI/%s" % (app, product, app, cli)
+
+
+def vscode_product_version():
+    return _version("vscode_product")
+
+
+def cli_version():
+    return _version("cli")
+
+
+def sdk_version():
+    return _version("sdk")
+
+
+def node_version():
+    return _version("node")
 
 PRODUCT_DESKTOP = "workbuddy"
 PRODUCT_VSCODE = "vscode"
@@ -430,8 +509,8 @@ def build_identity_headers(product, realm, uid, token,
         conv_req_id = str(turn_request_id or "").strip() or new_message_id()
 
     if product == PRODUCT_DESKTOP:
-        client_ver = DESKTOP_VERSION_CN if is_cn else DESKTOP_VERSION_INTL
-        chat_ua = DESKTOP_UA_CN if is_cn else DESKTOP_UA_INTL
+        client_ver = desktop_version(realm)
+        chat_ua = desktop_ua(realm)
         headers = {
             "X-Agent-Intent": "craft",
             "X-Agent-Purpose": "conversation",
@@ -451,7 +530,16 @@ def build_identity_headers(product, realm, uid, token,
             "X-Conversation-Message-ID": msg_id,
             "X-Request-ID": msg_id,
         }
-        headers.update(trace_headers())
+        compat = desktop_chat_compat_enabled()
+        headers.update(trace_headers(with_parent=compat))
+        if compat:
+            # Desktop profile reported by workbuddy2api-panel's headers.go
+            # (CN 5.8.3 / intl 5.8.4); shared SDK values remain configurable.
+            # Not a claim that Python's TLS stack matches the official client.
+            sdk_headers = cli_stainless_headers()
+            # Desktop request timeout is not verified; do not copy CLI's budget.
+            sdk_headers.pop("x-stainless-timeout", None)
+            headers.update(sdk_headers)
     elif product == PRODUCT_VSCODE:
         # 官方 VSCode 扩展 4.12.39997873 的 chat 请求头（解包源码实锤）：
         #   - 全局拦截器：UA / X-IDE-* / X-Product-Version（UserAgent +
@@ -473,7 +561,7 @@ def build_identity_headers(product, realm, uid, token,
             "X-IDE-Type": VSCODE_PLATFORM,
             "X-IDE-Name": VSCODE_PLATFORM,
             "X-IDE-Version": vscode_ide_version(),
-            "X-Product-Version": VSCODE_PRODUCT_VERSION,
+            "X-Product-Version": vscode_product_version(),
             "X-Env-ID": VSCODE_ENV_ID,
             # 官方主 chat 代码路径没有 X-Product（只有 codewiki 路径有）。本 PR
             # 保留现状，避免误删；「主 chat 是否发 X-Product」待 5.8.x 抓包确认。
@@ -510,7 +598,7 @@ def build_identity_headers(product, realm, uid, token,
         # gzip：官方主 chat 默认压缩（RequestBodyGzip=true → executeByMode 置
         # enableRequestBodyGzip → createCustomFetch 压缩），由 wb_proxy 统一做。
     else:  # PRODUCT_CLI
-        ide_version = DEFAULT_IDE_VERSION
+        ide_version = cli_version()
         headers = {
             "X-Agent-Intent": "craft",
             "X-Agent-Purpose": "conversation",
@@ -536,6 +624,13 @@ def build_identity_headers(product, realm, uid, token,
         headers["X-Private-Data"] = "true" if enterprise_id else "false"
         headers.update(cli_stainless_headers())
         headers.update(trace_headers(with_parent=True))
+
+    # 静态 API Key（ck_/pt_）：官方 CLI 两个头都发（Authorization 与 X-API-Key
+    # 任一均可鉴权）。只发 Authorization 时，/v3/config 的模型清单只下发 54 条
+    # 而不是 56 条——差的 4 个（glm-5.2-aicc / glm-5.3-flashx / kimi-k3-2 /
+    # minimax-m3-pay）会静默消失，所以两头都发。
+    if str(token or "").startswith(("ck_", "pt_")):
+        headers["X-API-Key"] = str(token)
 
     if enterprise_id:
         headers["X-Enterprise-Id"] = str(enterprise_id)

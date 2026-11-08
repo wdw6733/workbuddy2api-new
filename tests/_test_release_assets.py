@@ -40,7 +40,8 @@ import release_tools as tools  # noqa: E402
 # reads them from tests.yml rather than from this tuple - this is the
 # expectation the reader checks that derivation against.
 EXPECTED_LEGS = (
-    "ubuntu-latest / python 3.9",
+    # Pinned because ubuntu-latest moved to 26.04, which has no 3.9 build.
+    "ubuntu-24.04 / python 3.9",
     "ubuntu-latest / python 3.12",
     "windows-latest / python 3.12",
 )
@@ -297,6 +298,26 @@ class ManifestTests(unittest.TestCase):
             self.assertNotIn(name, listed)
 
 
+class VisibleLauncherTests(unittest.TestCase):
+    """Issue #559: the silent default stays, the console entry is opt-in."""
+
+    def test_wrappers_select_the_console_branch(self):
+        for wrapper, target in (
+                ("start-wb-proxy-visible.bat", "start-wb-proxy.bat"),
+                ("start-wb-proxy-lan-visible.bat", "start-wb-proxy-lan.bat")):
+            text = read(wrapper)
+            self.assertIn('set "WB_LAUNCH_MODE=console"', text)
+            self.assertIn('call "%~dp0' + target + '" %*', text)
+
+    def test_main_launchers_check_the_mode_before_pythonw(self):
+        for name in ("start-wb-proxy.bat", "start-wb-proxy-lan.bat"):
+            text = read(name)
+            mode = text.find('if /i "%WB_LAUNCH_MODE%"=="console" goto use_python')
+            pythonw = text.find("prefer pythonw")
+            self.assertGreaterEqual(mode, 0, name)
+            self.assertGreater(pythonw, mode, name)
+
+
 class RuntimeTrimTests(unittest.TestCase):
     """The trim rules reproduce the runtime the existing package ships."""
 
@@ -315,8 +336,11 @@ class RuntimeTrimTests(unittest.TestCase):
         local = {os.path.basename(p)[:-3] for p in glob.glob(os.path.join(ROOT, "wb_*.py"))}
         # sys / time and friends are compiled into python312.dll, so the trim
         # cannot remove them and they have no Lib/ file to check.
+        # Windows built-in C modules (msvcrt / nt / winreg) are compiled into
+        # python312.dll on Windows and have no Lib/ file; exclude them when running on POSIX.
+        windows_builtins = ("msvcrt", "nt", "winreg", "math")
         needed = sorted(m for m in imported
-                        if m not in local and m not in sys.builtin_module_names)
+                        if m not in local and m not in sys.builtin_module_names and m not in windows_builtins)
         self.assertTrue(needed)
         covered = set(portable_runtime.REQUIRED_FILES)
         missing = [m for m in needed
@@ -434,6 +458,14 @@ class PortableZipTests(unittest.TestCase):
             self.assertEqual(manifest["runtime"]["prefix"], "python/")
             self.assertEqual(manifest["runtime"]["python"], portable_runtime.RUNTIME_VERSION)
             self.assertGreater(manifest["runtime"]["files"], 0)
+            # #573: an image / rootfs deployment only owns the app layer; the
+            # launchers and the bundled pricing snapshot are portable-only.
+            app = manifest["profiles"]["app"]
+            self.assertIn("wb_proxy.py", app)
+            self.assertIn("dashboard.html", app)
+            self.assertNotIn("pricing/pricing.json", app)
+            self.assertNotIn("start-wb-proxy.bat", app)
+            self.assertTrue(set(app) <= set(files))
 
     def test_the_launchers_look_where_the_runtime_is(self):
         # The packaged path and the path the launcher probes have to agree, or

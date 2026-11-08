@@ -114,6 +114,15 @@ class MaskTextTest(unittest.TestCase):
                      "138123456789", "0138123456789", "113812345678"):
             self.assertEqual(wb_proxy._mask_text(text), text, text)
 
+    def test_an_identifier_with_a_phone_shaped_run_is_left_alone(self):
+        # #581：国内号 uid 里的一段 `179-97517476` 满足 3-4-4 形状，但左右紧邻
+        # 十六进制字符，不是号码。掩码它会让面板拿到池子里不存在的 uid。
+        uid = "6ef20bf4-76fa-4085-b179-97517476cc1e"
+        self.assertEqual(wb_proxy._mask_text(uid), uid)
+        # 同一个号码写在散文里仍然要掩码（中文是合法边界）。
+        self.assertEqual(wb_proxy._mask_text("账号179-97517476已停用"),
+                         "账号179****7476已停用")
+
 
 class RedactAccountNamesTest(unittest.TestCase):
     """递归 + copy-on-write。"""
@@ -146,6 +155,28 @@ class RedactAccountNamesTest(unittest.TestCase):
         # "15349000000" 是 11 位 1[3-9] 串，文本级会命中——如实钉住这一点，
         # 真实载荷里没有这样的字段（实盘 diff 验证），所以不会造成损坏。
         self.assertEqual(out["count"], "153****0000")
+
+    def test_identity_fields_are_never_rewritten(self):
+        # #581：uid 被改写成池子里不存在的值，面板再拿它调 /accounts 就 404
+        # （「操作失败: no such account」）。标识符字段一律原样。
+        uid = "6ef20bf4-76fa-4085-b179-97517476cc1e"
+        obj = {"accounts": [{"uid": uid, "nickname": "老王",
+                             "machineId": uid, "sessionId": uid,
+                             "file": uid + ".json"}]}
+        out = wb_proxy._redact_account_names(obj)
+        account = out["accounts"][0]
+        self.assertEqual(account["uid"], uid)
+        self.assertEqual(account["machineId"], uid)
+        self.assertEqual(account["sessionId"], uid)
+        self.assertEqual(account["file"], uid + ".json")
+        # 同一份载荷里的昵称仍然脱敏。
+        self.assertEqual(out["accounts"][0]["nickname"], "老王")
+
+    def test_a_phone_nickname_is_still_masked_next_to_identity_fields(self):
+        uid = "6ef20bf4-76fa-4085-b179-97517476cc1e"
+        out = wb_proxy._redact_account_names({"uid": uid, "nickname": PHONE})
+        self.assertEqual(out["uid"], uid)
+        self.assertEqual(out["nickname"], PHONE_MASKED)
 
     def test_logs_and_msg_channels_are_covered(self):
         # 昵称被拼进字符串、键名不是 nickname 的那些通道（v1 漏掉的一类）
@@ -213,6 +244,9 @@ class LogEgressTest(unittest.TestCase):
         with mock.patch.object(sys, "stderr", stream):
             wb_proxy.log("[任务福利] 账号 [%s] 网页通道打卡: OK" % PHONE,
                          tag="tasks")
+            # 写 stderr 由后台线程承担（#642 之前的写法会在请求线程里同步写）：
+            # 等这一行真正落下去再断言，否则读到的是「还没写」的空串。
+            wb_proxy.flush_log_channel(1.0)
         written = stream.getvalue()
         self.assertNotIn(PHONE, written)
         self.assertIn(PHONE_MASKED, written)

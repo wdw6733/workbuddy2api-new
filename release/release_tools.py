@@ -139,6 +139,14 @@ def build_portable(version, tag, out_path, source=ROOT, runtime_dir=None,
         # strip the prefix without guessing the archive's shape.
         "root": root,
         "files": files,
+        # Deployment profiles (issue #573). A portable package owns everything
+        # below `files`; an image / rootfs deployment only owns the app layer it
+        # actually runs. Writing the rest into such a root creates files the
+        # image never had, and `pricing/pricing.json` in particular would shadow
+        # wb_pricing.py's inlined snapshot for good.
+        "profiles": {"app": [p for p in files
+                              if (p.startswith("wb_") and p.endswith(".py"))
+                              or p == "dashboard.html"]},
         # The runtime is one managed subtree rather than 500 manifest lines.
         "runtime": {
             "prefix": "python/",

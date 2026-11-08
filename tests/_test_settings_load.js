@@ -11,7 +11,7 @@
  * Run with Node.
  */
 const assert = require('assert');
-const {dashboardScript} = require('./_dashboard_source.js');
+const {dashboardHtml, dashboardScript} = require('./_dashboard_source.js');
 
 const script = dashboardScript();
 
@@ -155,14 +155,14 @@ global.__toasts = toasts;
   assert.equal(element('setPrivateData').value, 'false');
   assert.equal(element('setPrivateDataState').textContent, '(false)');
   assert.equal(element('setDailyChatWeb').checked, false);
-  // 网页通道重试：字段缺失时按默认（开、3 次）显示，次数框写回 3，状态行把
-  // 实际等待序列算出来（300 起、逐轮翻倍）。
-  assert.equal(element('setDailyChatWebRetry').checked, true, '重试开关没按默认写回');
-  assert.equal(element('setDailyChatWebAttempts').value, '3', '最多尝试次数没写回');
-  assert.equal(element('setDailyChatWebAttempts').disabled, false, '重试开着时次数框应可改');
-  assert.equal(element('setDailyChatWebTimeout').value, '300', '首轮等待秒数没写回');
-  assert.equal(element('setDailyChatWebRetryState').textContent,
-    '最多尝试 3 次 · 300 / 600 / 1200 秒', '重试状态行没写回');
+  // 预算模型：字段缺失时按默认（单账号 600 秒、单轮 300 秒、并发 1、启动补跑开）
+  // 显示；候选序列为空时是「自动」。
+  assert.equal(element('setDailyChatBudget').value, '600', '单账号预算没按默认写回');
+  assert.equal(element('setDailyChatTurnTimeout').value, '300', '单轮最长等待没写回');
+  assert.equal(element('setDailyChatWebConcurrency').value, '1', '并发数没写回');
+  assert.equal(element('setDailyChatStartupCatchup').checked, true, '启动补跑没按默认写回');
+  assert.equal(element('setDailyChatModelsState').textContent,
+    '(自动：首选 + 该区域免费模型)', '候选序列状态没写回');
   assert.equal(element('setLocalWebTools').checked, true);
   assert.equal(element('setRemainingPriority').checked, true,
     '剩余用量优先调度的复选框没写回');
@@ -172,7 +172,16 @@ global.__toasts = toasts;
   assert.equal(element('setWinMaxHeightState').textContent, '(当前 640px)',
     '窗口限高状态文案没写回');
 
-  realLog('loadSettings 完整性断言通过（18 项）');
+  /* 6. 标记里每个 id 只能出现一次：`getElementById` 静默取文档顺序上的第一个，
+     重复出来的第二个永远不会被回填，按钮改的也是第一个副本。实测 v1.9.2 设置页有两张
+     一模一样的「上游响应头超时」，下面那张输入框永远空着、点它的保存写的是上面那张的值。
+     先剥掉 <script>：脚本里的模板字符串同样会写 id="…"。 */
+  const markup = dashboardHtml().replace(/<script[\s\S]*?<\/script>/g, '');
+  const ids = [...markup.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]);
+  const dup = [...new Set(ids.filter((id, i) => ids.indexOf(id) !== i))];
+  assert.deepStrictEqual(dup, [], '页面里有重复的元素 id：' + dup.join(', '));
+
+  realLog('loadSettings 完整性断言通过（19 项）');
 })().catch(e => {
   console.log = realLog;
   console.error(e && e.stack || e);
