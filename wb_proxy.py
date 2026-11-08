@@ -83,6 +83,7 @@ import wb_usage_io
 import wb_settings
 import wb_webprompts
 import wb_tiers
+import wb_stations
 import wb_upstream_pool
 import wb_webtools
 import wb_identity
@@ -20979,6 +20980,8 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if path.startswith("/codearts"):
             return True
+        if path.startswith("/stations"):
+            return True
         return False
     def _strip_pinned_prefix_only(self):
         """Strip /u/<ref> from self.path; returns False for a malformed ref."""
@@ -21108,6 +21111,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_pricing()
         if path == "/settings":
             return self._get_settings()
+        if path == "/stations":
+            return self._get_stations()
         if path == "/updates":
             return self._get_updates()
         if path == "/updates/backups":
@@ -21135,6 +21140,117 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(404, "not found", "invalid_request_error")
     def _get_dashboard(self):
         return self._dashboard()
+
+    def _get_stations(self):
+        return self._json(200, {"stations": wb_stations.view(),
+                                "solver": wb_stations.solver_status()})
+
+    def _handle_stations(self, path, payload):
+        """面板公益站管理写接口：/stations/save | /stations/delete |
+        /stations/probe | /stations/models | /stations/balance |
+        /stations/detect-client。"""
+        if path == "/stations/save":
+            st_id = str(payload.get("id") or "").strip()
+            name = str(payload.get("name") or "").strip()
+            base_url = str(payload.get("base_url") or "").strip()
+            api_key = str(payload.get("api_key") or "").strip()
+            checkin_url = str(payload.get("checkin_url") or "").strip()
+            checkin_method = payload.get("checkin_method")
+            checkin_token = payload.get("checkin_token")
+            checkin_user_id = payload.get("checkin_user_id")
+            login_username = payload.get("login_username")
+            login_password = payload.get("login_password")
+            session_cookie = payload.get("session_cookie")
+            oauth_provider = payload.get("oauth_provider")
+            idp_cookie = payload.get("idp_cookie")
+            enabled = payload.get("enabled")
+            if enabled is not None:
+                enabled = bool(enabled)
+            priority = payload.get("priority")
+            client_profile = payload.get("client_profile")
+            if not name or not base_url:
+                return self._error(400, "name and base_url are required",
+                                   "invalid_request_error")
+            if st_id:
+                st = wb_stations.update_station(
+                    st_id, name=name, base_url=base_url,
+                    api_key=api_key or None, enabled=enabled,
+                    checkin_url=checkin_url or None, priority=priority,
+                    checkin_method=checkin_method,
+                    checkin_token=checkin_token,
+                    checkin_user_id=checkin_user_id,
+                    login_username=login_username,
+                    login_password=login_password,
+                    session_cookie=session_cookie,
+                    oauth_provider=oauth_provider,
+                    idp_cookie=idp_cookie,
+                    client_profile=client_profile)
+                if not st:
+                    return self._error(404, "station not found", "invalid_request_error")
+            else:
+                st = wb_stations.add_station(name, base_url, api_key, enabled=enabled,
+                                             priority=priority, checkin_url=checkin_url,
+                                             client_profile=client_profile or "browser")
+                if checkin_method:
+                    st = wb_stations.update_station(
+                        st["id"], checkin_method=checkin_method,
+                        checkin_token=checkin_token,
+                        checkin_user_id=checkin_user_id,
+                        login_username=login_username,
+                        login_password=login_password,
+                        session_cookie=session_cookie,
+                        oauth_provider=oauth_provider,
+                        idp_cookie=idp_cookie) or st
+            wb_stations.probe_one_async(st["id"])
+            wb_stations.fetch_balance_all_async()
+            return self._json(200, {"ok": True, "station": st})
+        if path == "/stations/delete":
+            st_id = str(payload.get("id") or "").strip()
+            if not st_id:
+                return self._error(400, "id is required", "invalid_request_error")
+            return self._json(200, {"ok": wb_stations.delete_station(st_id)})
+        if path == "/stations/probe":
+            st_id = str(payload.get("id") or "").strip()
+            if st_id:
+                st = wb_stations.probe(st_id)
+                if not st:
+                    return self._error(404, "station not found", "invalid_request_error")
+                return self._json(200, {"ok": True, "station": st})
+            # 无 id：全部测活
+            wb_stations.probe_all_async()
+            return self._json(200, {"ok": True, "probe_all": True})
+        if path == "/stations/models":
+            st_id = str(payload.get("id") or "").strip()
+            models = payload.get("models")
+            st = wb_stations.set_selected_models(st_id, models if isinstance(models, list) else [])
+            if not st:
+                return self._error(404, "station not found", "invalid_request_error")
+            return self._json(200, {"ok": True, "station": st})
+        if path == "/stations/detect-client":
+            # 出站身份自动检测：有些站只放行特定客户端（AnyRouter 要 Codex）。
+            # 逐个身份发一次 max_tokens=1 的 chat，第一个通的就是可用身份；
+            # save=True 时顺手写回站点配置。
+            st_id = str(payload.get("id") or "").strip()
+            if not st_id:
+                return self._error(400, "id is required", "invalid_request_error")
+            result = wb_stations.detect_client_profile(st_id)
+            if not result.get("ok"):
+                return self._json(200, result)
+            if payload.get("save"):
+                wb_stations.update_station(st_id, client_profile=result["profile"])
+            return self._json(200, result)
+        if path == "/stations/balance":
+            st_id = str(payload.get("id") or "").strip()
+            if st_id:
+                ok, bal = wb_stations.fetch_balance(st_id)
+                if not bal:
+                    st = wb_stations.get_station(st_id)
+                    if not st:
+                        return self._error(404, "station not found", "invalid_request_error")
+                return self._json(200, {"ok": ok, "balance": bal})
+            wb_stations.fetch_balance_all_async()
+            return self._json(200, {"ok": True, "balance_all": True})
+        return self._error(404, "not found", "invalid_request_error")
 
     def _get_panel_status(self):
         # Answer without a token: the dashboard needs to know whether to
@@ -21320,6 +21436,20 @@ class Handler(BaseHTTPRequestHandler):
                     "required": "standard",
                     "at": gate_at,
                 }
+        # 公益站(自定义)：勾选的模型并入统一清单，owned_by=station，命名带 @站点 后缀消歧。
+        # 与官方清单重名的条目跳过：同一个 ID 在 /v1/models 里出现两次会让
+        # 部分客户端（Cherry Studio / NextChat）的模型选择器出现重复项。
+        # 请求路由不受影响——同名时 resolve() 仍会先命中公益站。
+        seen = set()
+        for item in data:
+            mid = item.get("id")
+            if isinstance(mid, str):
+                seen.add(mid)
+        for item in wb_stations.models_entries():
+            if item.get("id") in seen:
+                continue
+            seen.add(item.get("id"))
+            data.append(item)
         payload = {"object": "list", "data": data,
                    "realm": req_realm or CURRENT_REALM}
         # 来源说明（面板展示用）：这批清单是上游 API 实时取的，还是读的
@@ -25028,6 +25158,11 @@ class Handler(BaseHTTPRequestHandler):
             "tool_choice": payload.get("tool_choice", "auto"),
             "parallel_tool_calls": payload.get("parallel_tool_calls", True),
         }
+        # 公益站路由：命中站点模型时走站点转发（Responses → Chat → 站点 → Responses）
+        station_route = wb_stations.resolve(chat_req.get("model"))
+        if station_route:
+            return self._station_responses(payload, chat_req, station_route,
+                                           custom_names, request_meta, ns_map)
         model = payload.get("model") or "deepseek-v4.1-flash"
         want_stream = bool(payload.get("stream"))
         t_start = time.time()
@@ -25388,6 +25523,10 @@ class Handler(BaseHTTPRequestHandler):
             chat_req = messages_to_chat(payload)
         except ValueError as exc:
             return self._anthropic_error(400, str(exc), "invalid_request_error")
+        # 公益站路由：命中站点模型时走站点转发（Messages → Chat → 站点 → Messages）
+        station_route = wb_stations.resolve(chat_req.get("model"))
+        if station_route:
+            return self._station_messages(payload, chat_req, station_route)
         model = chat_req.get("model") or "unknown"
         want_stream = bool(chat_req.get("stream"))
         session_key = extract_session_key(self.headers, chat_req)
@@ -25654,6 +25793,13 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/pricing/mapping":
                 return self._route_pricing_mapping(payload)
             return self._route_pricing_refresh(payload)
+        if path.startswith("/stations"):
+            if not self._panel_ok():
+                return self._error(401, "panel password required", "invalid_request_error")
+            payload = self._payload_or_error()
+            if payload is None:
+                return
+            return self._handle_stations(path, payload)
         if path == "/catalog/refresh":
             # Panel-only management write, like the pricing ones: it spends
             # one upstream /v3/config call and republishes that realm's
@@ -25814,6 +25960,14 @@ class Handler(BaseHTTPRequestHandler):
             _release_key_slot(self.key_entry)
 
     def _dispatch_chat_post(self, path, payload):
+        # 公益站路由：模型命中勾选的公益站模型时，绕过 WorkBuddy 账号池，
+        # 直接转发到对应站点（OpenAI 兼容透传）。
+        # responses 请求走 _handle_responses（内部自己 resolve 并做协议转换），
+        # 这里只拦 chat/completions 与 completions。
+        if path not in ("/v1/responses", "/responses"):
+            station_route = wb_stations.resolve(payload.get("model"))
+            if station_route:
+                return self._station_dispatch(path, payload, station_route)
         # 先挡背景请求：Codex 自己发的（记忆整理／环境建议／自动复核）
         # 不算「使用者实际使用」，一律本地拒绝，不碰上游。
         if BLOCK_BACKGROUND_REQUESTS:
@@ -26046,6 +26200,314 @@ class Handler(BaseHTTPRequestHandler):
             return self._messages_nonstream_response(
                 upstream, model, fp, account, t_start, base_body=chat_req,
                 session_key=session_key, realm="codearts", effort=effort)
+    def _station_open(self, payload, candidates, model, t_start):
+        """按候选顺序打开站点；连接失败 / 5xx / 429 自动切换下一站（故障转移）。
+
+        返回 (resp, st_id, real_model)。全部候选耗尽时已回错误响应并返回
+        (None, None, None)。
+        """
+        last_exc = None
+        last_detail = ""
+        tried = []
+        for st_id, real_model in candidates:
+            try:
+                resp = wb_stations.open_chat(st_id, real_model, payload)
+                # 这一站通了，说明它现在是好的：把之前失败留下的冷却清掉，
+                # 否则后续请求还会因为它「正在冷却」被排到候选末尾。
+                wb_stations.clear_cooling(st_id)
+                return (resp, st_id, real_model)
+            except urllib.error.HTTPError as exc:
+                detail = ""
+                try:
+                    detail = exc.read(600).decode("utf-8", "replace")
+                except Exception:
+                    pass
+                # 哪些状态码该换下一站？
+                #   429/5xx       站点过载或自身故障
+                #   401/403       该站的 Key 失效、或这个 Key 无权用该模型
+                #   404           该站其实没有这个模型（清单过时）
+                # 三者都是「这一站不行」，换站往往就能成——同名模型多站共享
+                # 时尤其明显：旧逻辑对 401/403 直接回错，第一站 Key 失效就把
+                # 整条链路打死，后面的好站根本没机会。
+                # 只有 400/422 是请求本身的问题，换站也一样错，直接回。
+                if exc.code in (401, 403, 404, 408, 429, 500, 502, 503, 504):
+                    wb_stations.mark_failed(st_id)
+                    last_exc = exc
+                    last_detail = detail
+                    # 每一站的响应摘要都留在错误文案里：多站共享时用户最需要
+                    # 知道「哪一站、因为什么」失败（例如某站 Key 失效返回
+                    # 「无效的令牌」），而不是只知道最后那一站。
+                    brief = detail[:60].replace("\n", " ").strip()
+                    tried.append("%s(HTTP %d%s)" % (
+                        st_id, exc.code, ("：" + brief) if brief else ""))
+                    log("station-failover: model=%s station=%s HTTP %d -> 切换下一站%s"
+                        % (model, st_id, exc.code,
+                           ("｜" + detail[:120].replace("\n", " ")) if detail else ""))
+                    continue
+                record_error(model, exc.code, "station HTTP %d: %s" % (exc.code, detail[:200]),
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             key=self._key_id())
+                self._error(exc.code, "公益站上游 %d: %s" % (exc.code, detail))
+                return (None, None, None)
+            except Exception as exc:
+                wb_stations.mark_failed(st_id)
+                last_exc = exc
+                tried.append("%s(%s)" % (st_id, str(exc)[:40]))
+                log("station-failover: model=%s station=%s %s -> 切换下一站"
+                    % (model, st_id, str(exc)[:80]))
+                continue
+        # 全部候选耗尽
+        if last_exc is None:
+            message = "无可用公益站"
+        else:
+            message = "公益站全部不可用（已尝试 %s）: %s" % (" → ".join(tried), last_exc)
+            if last_detail:
+                message += "｜最后一站响应: " + last_detail[:200].replace("\n", " ")
+        record_error(model, 502, message,
+                     elapsed_ms=int((time.time() - t_start) * 1000),
+                     key=self._key_id())
+        self._error(502, message)
+        return (None, None, None)
+
+    def _station_dispatch(self, path, payload, candidates):
+        """把命中公益站的请求转发到站点（OpenAI 兼容透传 + 故障转移）。
+
+        candidates = [(station_id, real_model), ...]，按优先级排序。透传不做
+        协议改写，只换模型名、计用量。流式与非流式都原样回放站点响应。
+        """
+        model = payload.get("model") or (candidates[0][1] if candidates else "station")
+        want_stream = bool(payload.get("stream"))
+        t_start = time.time()
+        log("station: model=%s candidates=%d stream=%s key=%s"
+            % (model, len(candidates), want_stream,
+               key_label(self._key_id()) or "-"))
+        resp, st_id, real_model = self._station_open(payload, candidates, model, t_start)
+        if resp is None:
+            return
+        with resp:
+            if want_stream:
+                return self._station_stream(resp, model, t_start)
+            return self._station_nonstream(resp, model, t_start)
+
+    def _station_stream(self, resp, model, t_start):
+        """站点流式透传：原样回放 SSE，顺带提取 usage 记账。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        if cors_origin_allowed(self.path):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        usage = None
+        first_ms = None
+        seen_done = False
+        try:
+            for raw in resp:
+                if first_ms is None:
+                    first_ms = int((time.time() - t_start) * 1000)
+                try:
+                    line = raw.decode("utf-8", "replace")
+                except Exception:
+                    line = ""
+                self.wfile.write(raw if isinstance(raw, bytes) else raw.encode("utf-8"))
+                self.wfile.flush()
+                data = line.strip()
+                if data.startswith("data:"):
+                    data = data[5:].strip()
+                if data == "[DONE]":
+                    seen_done = True
+                    continue
+                if data and not data.startswith(":"):
+                    try:
+                        obj = json.loads(data)
+                        if isinstance(obj, dict) and obj.get("usage"):
+                            usage = obj["usage"]
+                    except Exception:
+                        pass
+            if not seen_done:
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+        except Exception:
+            # 客户端断开 / 连接被重置：尽力记账后收尾。
+            pass
+        try:
+            record_usage(model, usage, stream=True,
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         ttft_ms=first_ms, key=self._key_id())
+        except Exception:
+            pass
+
+    def _station_nonstream(self, resp, model, t_start):
+        """站点非流式透传：整读响应、提取 usage 记账、原样回放。"""
+        body = resp.read(16 * 1024 * 1024)
+        obj = None
+        try:
+            obj = json.loads(body.decode("utf-8", "replace"))
+        except Exception:
+            obj = None
+        usage = obj.get("usage") if isinstance(obj, dict) else None
+        record_usage(model, usage, stream=False,
+                     elapsed_ms=int((time.time() - t_start) * 1000),
+                     key=self._key_id())
+        if obj is not None:
+            return self._json(200, obj)
+        return self._json(200, {"raw": body.decode("utf-8", "replace")})
+
+    def _station_responses(self, payload, chat_req, candidates, custom_names, request_meta, ns_map):
+        """公益站 Responses：Chat 请求转发站点（含故障转移），响应转回 Responses 格式。"""
+        model = payload.get("model") or (candidates[0][1] if candidates else "station")
+        want_stream = bool(payload.get("stream"))
+        chat_req["model"] = candidates[0][1] if candidates else model
+        chat_req["stream"] = True
+        t_start = time.time()
+        fp = prompt_fingerprint(chat_req.get("messages"))
+        log("station-responses: model=%s candidates=%d stream=%s key=%s"
+            % (model, len(candidates), want_stream,
+               key_label(self._key_id()) or "-"))
+        resp, st_id, real_model = self._station_open(chat_req, candidates, model, t_start)
+        if resp is None:
+            return
+        with resp:
+            if not want_stream:
+                try:
+                    chat_obj = aggregate_stream(resp, real_model, None)
+                except Exception as exc:
+                    record_error(model, 502, "station responses error: %s" % exc,
+                                 elapsed_ms=int((time.time() - t_start) * 1000),
+                                 key=self._key_id())
+                    return self._error(502, "公益站响应解析失败: %s" % exc)
+                result = chat_to_response(chat_obj, model, custom_names, request_meta, ns_map,
+                                          sources=[])
+                record_usage(model, chat_obj.get("usage"), stream=False,
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             fp=fp, key=self._key_id())
+                return self._json(200, result)
+            return self._station_responses_stream(
+                resp, model, custom_names, request_meta, ns_map, chat_req, fp, t_start)
+
+    def _station_responses_stream(self, resp, model, custom_names, request_meta, ns_map,
+                                  base_body, fp, t_start):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        if cors_origin_allowed(self.path):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        holder = {
+            "custom_names": custom_names,
+            "request_meta": request_meta,
+            "namespace_map": ns_map,
+            "base_body": base_body,
+            "web_sources": [],
+            "usage": None,
+        }
+        first_ms = None
+        try:
+            for frame in stream_responses_events(resp, model, holder):
+                if first_ms is None:
+                    first_ms = int((time.time() - t_start) * 1000)
+                self.wfile.write(clean_responses_frame(frame))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            wall = int((time.time() - t_start) * 1000)
+            record_usage(model, holder.get("usage"), stream=True, elapsed_ms=wall,
+                         ttft_ms=first_ms, fp=fp, outcome="client_aborted",
+                         key=self._key_id())
+            return
+        except Exception as exc:
+            wall = int((time.time() - t_start) * 1000)
+            record_error(model, 502, "station responses stream aborted: %s" % exc,
+                         elapsed_ms=wall, usage=holder.get("usage"), stream=True,
+                         ttft_ms=first_ms, fp=fp, outcome="upstream_aborted",
+                         key=self._key_id())
+            return
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        wall = int((time.time() - t_start) * 1000)
+        record_usage(model, holder.get("usage"), stream=True, elapsed_ms=wall,
+                     ttft_ms=first_ms,
+                     gen_ms=(wall - first_ms) if first_ms is not None else None,
+                     fp=fp, key=self._key_id())
+
+    def _station_messages(self, payload, chat_req, candidates):
+        """公益站 Messages：Chat 请求转发站点（含故障转移），响应转回 Messages 格式。"""
+        model = payload.get("model") or (candidates[0][1] if candidates else "station")
+        want_stream = bool(chat_req.get("stream"))
+        chat_req["model"] = candidates[0][1] if candidates else model
+        chat_req["stream"] = True
+        t_start = time.time()
+        fp = prompt_fingerprint(chat_req.get("messages"))
+        log("station-messages: model=%s candidates=%d stream=%s key=%s"
+            % (model, len(candidates), want_stream,
+               key_label(self._key_id()) or "-"))
+        resp, st_id, real_model = self._station_open(chat_req, candidates, model, t_start)
+        if resp is None:
+            return
+        with resp:
+            if not want_stream:
+                try:
+                    chat_obj = aggregate_stream(resp, real_model, None)
+                except Exception as exc:
+                    record_error(model, 502, "station messages error: %s" % exc,
+                                 elapsed_ms=int((time.time() - t_start) * 1000),
+                                 key=self._key_id())
+                    return self._anthropic_error(502, "公益站响应解析失败: %s" % exc)
+                result = chat_to_messages(chat_obj)
+                record_usage(model, chat_obj.get("usage"), stream=False,
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             fp=fp, key=self._key_id())
+                return self._json(200, result)
+            return self._station_messages_stream(resp, model, fp, t_start)
+
+    def _station_messages_stream(self, resp, model, fp, t_start):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        if cors_origin_allowed(self.path):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        holder = {"usage": None}
+        first_ms = None
+        try:
+            for frame in stream_messages_events(resp, model, holder):
+                if first_ms is None:
+                    first_ms = int((time.time() - t_start) * 1000)
+                self.wfile.write(frame)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            wall = int((time.time() - t_start) * 1000)
+            record_usage(model, holder.get("usage"), stream=True, elapsed_ms=wall,
+                         ttft_ms=first_ms, fp=fp, outcome="client_aborted",
+                         key=self._key_id())
+            return
+        except Exception as exc:
+            wall = int((time.time() - t_start) * 1000)
+            record_error(model, 502, "station messages stream aborted: %s" % exc,
+                         elapsed_ms=wall, usage=holder.get("usage"), stream=True,
+                         ttft_ms=first_ms, fp=fp, outcome="upstream_aborted",
+                         key=self._key_id())
+            try:
+                self.wfile.write(anthropic_sse_frame("error", {
+                    "error": {"type": "api_error", "message": str(exc)}}))
+                self.wfile.flush()
+            except Exception:
+                pass
+            return
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        wall = int((time.time() - t_start) * 1000)
+        record_usage(model, holder.get("usage"), stream=True, elapsed_ms=wall,
+                     ttft_ms=first_ms,
+                     gen_ms=(wall - first_ms) if first_ms is not None else None,
+                     fp=fp, key=self._key_id())
 
     def _chat_stream_response(self, upstream, model, fp, account, t_start, effort=None,
                               reopen=None, headers_sent=False, retried=False,
@@ -26609,6 +27071,8 @@ def _bootstrap_runtime(args):
     POOL.load()
     POOL.apply_proxy_slots()
     apply_reserve_credits()
+    # 公益站聚合：载入站点、重建路由表、后台测活已启用站点。
+    wb_stations.init(ACCOUNTS_DIR, log=log)
     # WB_MAX_CONCURRENT_CHAT=auto: size the chat ceiling from the pool that was
     # just loaded. Runs before the listener exists, so no request can hold a
     # slot yet and the semaphore swap is safe.

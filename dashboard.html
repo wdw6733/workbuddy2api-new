@@ -5126,6 +5126,7 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
 <body>
 <header>
   <div class="header-left" style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
+
     <h1 id="classicTitle"><span class="dot" id="statusDot"></span>WorkBuddy 网关</h1>
     <button type="button" class="console-mobile-menu" id="btnConsoleNav" onclick="toggleConsoleNav()" aria-label="打开功能导航" aria-controls="consoleSidebar" aria-expanded="false">☰</button>
     <div class="console-product">
@@ -5133,6 +5134,7 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
       <span class="console-wordmark">WorkBuddy<span>API HUB</span></span>
     </div>
     <div class="console-service"><span id="consoleStatusSlot"></span><span>本地网关</span><span class="console-port" id="consolePort">8788</span></div>
+
     <a class="gh-link" href="https://github.com/ardeyouxipianyi/workbuddy2api-hub" target="_blank" rel="noopener noreferrer"
        title="查看 WorkBuddy 项目仓库" aria-label="WorkBuddy 项目仓库">
       <svg viewBox="0 0 16 16" aria-hidden="true">
@@ -5341,6 +5343,9 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
       <button type="button" class="console-nav-link" id="btnNavModels" onclick="openModelCatalog()">模型管理</button>
       <button class="main-nav-btn" id="btnNavTasks" onclick="switchMainTab('tasks')">
         任务与福利
+      </button>
+      <button class="main-nav-btn" id="btnNavStations" onclick="switchMainTab('stations')">
+        公益站
       </button>
     </div>
     <div class="console-nav-group">
@@ -6197,6 +6202,109 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
 
 
 
+  <div id="pageStations" class="main-page">
+    <div style="margin-bottom:16px">
+      <h2 style="margin:0;font-size:17px;color:var(--fg);font-family:var(--serif);font-weight:600;letter-spacing:.02em">公益站管理</h2>
+      <div style="font-size:12px;color:var(--dim);margin-top:4px">接入 OpenAI 兼容的第三方公益站，测活并勾选模型后，即可在下游客户端（WorkBuddy / Cherry Studio 等）直接调用。</div>
+    </div>
+
+    <section>
+      <h2>站点列表</h2>
+      <div class="toolbar">
+        <button class="primary" onclick="openStationEdit()">+ 添加站点</button>
+        <button class="sec" onclick="probeStationsAll()">全部测活</button>
+        <button class="sec" onclick="loadStations(true)">刷新</button>
+        <span style="align-self:center;font-size:12px;color:var(--dim)" id="stationsHint">同名模型自动合并；多站共享时按「优先级 + 延迟」选站，失败自动切换。点站点名称或地址可在新标签页打开站点，手动完成签到。</span>
+      </div>
+      <div style="overflow-x:auto">
+        <table class="data-table" style="width:100%;margin:0;border-collapse:collapse;font-size:12px">
+          <thead><tr>
+            <th style="text-align:left">站点</th>
+            <th style="text-align:left">状态</th>
+            <th style="text-align:left">响应时间</th>
+            <th style="text-align:left">余额</th>
+            <th style="text-align:left">说明</th>
+            <th style="text-align:left">操作</th>
+          </tr></thead>
+          <tbody id="stationsTbody">
+            <tr><td colspan="6" style="color:var(--dim);text-align:center;padding:18px">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+  <div class="modal-mask" id="clientDetectModal" onclick="if(event.target===this) closeClientDetect()">
+    <div class="modal" role="dialog" aria-modal="true" style="width:min(560px,100%)">
+      <div class="modal-hd">
+        <h2 id="clientDetectTitle">检测客户端</h2>
+        <button class="modal-x" onclick="closeClientDetect()" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-bd" id="clientDetectBody"></div>
+      <div class="modal-ft">
+        <button class="sec" onclick="closeClientDetect()">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-mask" id="stationEditModal" onclick="if(event.target===this) closeStationEdit()">
+    <div class="modal" role="dialog" aria-modal="true" style="width:min(560px,100%)">
+      <div class="modal-hd">
+        <h2 id="stationEditTitle">添加站点</h2>
+        <button class="modal-x" onclick="closeStationEdit()" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-bd">
+        <input type="hidden" id="stationEditId">
+        <div style="font-size:12px;color:var(--dim);margin-bottom:4px">站点名称</div>
+        <input id="stationEditName" class="slot-input" style="margin-bottom:12px" placeholder="例如 幻城网安">
+        <div style="font-size:12px;color:var(--dim);margin-bottom:4px">接口地址（Base URL）</div>
+        <input id="stationEditUrl" class="slot-input" style="margin-bottom:6px" placeholder="https://api.example.com/v1">
+        <div class="hint" style="margin:0 0 12px">填 OpenAI 兼容的 /v1 地址；末尾是否带 /v1 均可，会自动补全。</div>
+        <div style="font-size:12px;color:var(--dim);margin-bottom:4px">API Key</div>
+        <input id="stationEditKey" class="slot-input" style="margin-bottom:12px" placeholder="sk-...（编辑时留空则保留原值）">
+        <div style="font-size:12px;color:var(--dim);margin-bottom:4px">优先级（越小越优先，故障转移顺序）</div>
+        <input id="stationEditPriority" type="number" class="slot-input" style="margin-bottom:12px" value="0" min="0" step="1">
+        <div style="font-size:12px;color:var(--dim);margin-bottom:4px">出站身份（伪装客户端）</div>
+        <select id="stationEditClient" class="slot-input" style="margin-bottom:6px">
+          <option value="browser">浏览器（默认，兼容性最好）</option>
+          <option value="codex">Codex CLI（AnyRouter 等要求 Codex 的站）</option>
+          <option value="claude">Claude Code CLI</option>
+          <option value="vscode">VS Code 扩展</option>
+          <option value="cli">命令行 CLI</option>
+          <option value="wb">WorkBuddy 桌面端</option>
+        </select>
+        <div class="hint" style="margin:0 0 12px">有的站只放行特定客户端（如 AnyRouter 要求 Codex）。不确定就点列表里的「检测客户端」自动试。</div>
+        <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
+          <input type="checkbox" id="stationEditEnabled" checked style="margin:0"> 启用该站点
+        </label>
+      </div>
+      <div class="modal-ft">
+        <button class="sec" onclick="closeStationEdit()">取消</button>
+        <button class="primary" onclick="saveStation()">保存并测活</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-mask" id="stationModelsModal" onclick="if(event.target===this) closeStationModels()">
+    <div class="modal" role="dialog" aria-modal="true" style="width:min(720px,100%)">
+      <div class="modal-hd">
+        <h2>勾选模型 <em id="stationModelsMeta" style="color:var(--dim);font-size:12px;font-style:normal"></em></h2>
+        <button class="modal-x" onclick="closeStationModels()" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-bd">
+        <div class="toolbar">
+          <button class="sec mini" onclick="stationModelsToggle(true)">全选</button>
+          <button class="sec mini" onclick="stationModelsToggle(false)">全不选</button>
+        </div>
+        <div id="stationModelsList" style="max-height:46vh;overflow-y:auto;display:flex;flex-wrap:wrap;gap:8px 16px"></div>
+        <p class="hint" style="margin:12px 0 0" id="stationModelsHint">勾选的模型将出现在网关的 /v1/models 中。</p>
+      </div>
+      <div class="modal-ft">
+        <button class="sec" onclick="closeStationModels()">取消</button>
+        <button class="primary" onclick="saveStationModels()">保存勾选</button>
+      </div>
+    </div>
+  </div>
+
   <div id="pageSettings" class="main-page">
     <div class="next-settings-groups" id="nextSettingsGroups">
       <button type="button" class="next-settings-group active" data-settings-group="basic" onclick="nextSettingsGroup('basic', this)">基础</button>
@@ -6270,6 +6378,10 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
         取消勾选可隐藏对应功能入口，勾选后恢复；偏好保存在本网关。「设置」入口固定保留。
       </div>
       <div id="setPagesList" style="display:flex;flex-wrap:wrap;gap:8px 20px"></div>
+      <div style="margin-top:12px">
+        <button class="sec mini" id="btnShowAllPages" onclick="showAllPages()"
+                title="把所有被收起的页签一次性放回顶部">全部显示</button>
+      </div>
     </section>
 
     <section data-cat="access">
@@ -7303,8 +7415,25 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
       <div style="font-size:12px;color:var(--dim);margin-top:4px">检测本机已安装的 AI 编程客户端，一键把它们的配置指向本网关；原始文件会先备份，随时可一键还原。</div>
     </div>
 
+    <!-- 远程 / 容器部署（看板不是从网关所在机器打开的）时一键配置没有落点：apply
+         改的是容器里的配置目录，到不了用户自己的电脑。上游的做法是把整个入口藏掉，
+         结果就是「刷新一瞬间有、随后消失」，用户只会以为功能没了。这里不藏入口，
+         把原因写清楚，并保留「其他客户端」里那些可以直接复制的地址。 -->
+    <div id="agentRemoteNotice" hidden
+         style="margin-bottom:20px;padding:12px 14px;border:1px solid var(--warn,#d97706);border-radius:14px;background:var(--panel2);font-size:12.5px;line-height:1.7;color:var(--fg)">
+      <div style="font-weight:600;margin-bottom:6px">一键配置在这里用不了（看板是远程打开的）</div>
+      <div style="color:var(--dim)">
+        看板是从另一台机器（或容器端口映射）打开的，一键配置改的是<b>网关进程所在机器</b>的配置目录，
+        到你自己的电脑上无效，所以本页只保留手动接入信息。<br>
+        想用一键配置：把网关直接跑在要配置的那台电脑上，再从
+        <span class="mono">127.0.0.1</span> 打开看板。<br>
+        手动接入：把 <span class="mono" id="agentRemoteUrl">-</span> 填进客户端的
+        Base URL / API 地址，Key 到「设置 → API Key」复制；下面「其他客户端」里的地址可以直接点复制。
+      </div>
+    </div>
+
     <!-- 左侧导航由 initPageNav() 扫描本页的 section 自动生成，增删区块无需同步改动。 -->
-    <section>
+    <section data-needs-local>
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
         <div>
           <h2 style="margin:0">连接信息 <em id="agentConnState"></em></h2>
@@ -7332,7 +7461,7 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
       <div style="font-size:12px;color:var(--dim);margin-top:10px">「全局 API Key」表示不在客户端配置里写入具体 Key，客户端沿用网关当前生效的全局 Key。</div>
     </section>
 
-    <section>
+    <section data-needs-local>
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
         <div>
           <h2 style="margin:0">本机客户端 <em id="agentDetectState"></em></h2>
@@ -14136,6 +14265,23 @@ function renderPageVisibility(){
   }
 }
 
+/* 一次把所有收起的页签放回来。页签被收起来之后，面板里除了这个开关没有别的地方
+   能把它找回来，而「哪个勾选框对应哪个页签」并不总是显而易见（尤其是升级后新增
+   的页面）——给一个一键还原，比让人对着清单猜要省事。 */
+async function showAllPages(){
+  if(!_hiddenPages.length) return;
+  const before = _hiddenPages.slice();
+  applyHiddenPages([]);
+  try {
+    const res = await postJSON('/settings/save', {hidden_pages: []});
+    if(res && Array.isArray(res.hidden_pages)) applyHiddenPages(res.hidden_pages);
+    toast('已显示全部页签', 'ok');
+  } catch(e) {
+    applyHiddenPages(before);
+    toast('页面显示设置保存失败: ' + e.message, 'bad');
+  }
+}
+
 /* 显式选择走既有的 settings save 通道（一个键的 patch，不动别的设置）。 */
 async function togglePageVisibility(key){
   const before = _hiddenPages.slice();
@@ -17905,26 +18051,54 @@ async function autoAssignSlots(){
   toast('已为 ' + unbound.length + ' 个未绑定账号分配代理出口', 'ok');
 }
 
-/* 智能体配置只在「浏览器和网关进程同一台机器」时成立（issue #246）：服务端 /
-   Docker / OpenWrt 部署下看板是远程打开的，一键配置改的是容器或路由器里的
-   配置目录，到不了用户自己的电脑。服务端据此回 enabled:false，这里把入口整个
-   撤掉；判定失败（网络抖动等）保持可见——本机用户不该因此丢掉这个入口。 */
+/* 智能体配置的「一键写入」只在「浏览器和网关进程同一台机器」时成立（issue #246）：
+   服务端 / Docker / OpenWrt 部署下看板是远程打开的，一键配置改的是容器或路由器
+   里的配置目录，到不了用户自己的电脑。服务端据此回 enabled:false。
+
+   注意这里**不再把入口藏掉**。藏掉的后果是「刷新一瞬间有、随后消失」——用户看到
+   一个页签闪一下就没了，只会以为功能坏了或者版本不对，根本无从判断这是部署形态的
+   限制。改成：入口一直在，进页面后用一条说明讲清为什么不能一键写、该怎么手动接
+   （「其他客户端」里的地址远程也能用，那才是这种部署下真正有价值的部分）。 */
 let AGENTS_AVAILABLE = true;
+let AGENTS_REMOTE_REASON = '';
+
+function renderAgentsRemoteNotice(){
+  const box = document.getElementById('agentRemoteNotice');
+  const on = !AGENTS_AVAILABLE;
+  if(box){
+    box.hidden = !on;
+    if(on){
+      const url = document.getElementById('agentRemoteUrl');
+      if(url) url.textContent = location.origin + '/v1';
+      if(AGENTS_REMOTE_REASON){
+        box.title = AGENTS_REMOTE_REASON;
+      }
+    }
+  }
+  // 「连接信息」「本机客户端」两块都是给一键写入用的，远程打开时既没有本机客户端
+  // 可检测、Key / 模型下拉也拿不到数据，留着只会是一片空白和空下拉，一并收起。
+  Array.from(document.querySelectorAll('#pageAgents [data-needs-local]')).forEach(function(el){
+    el.hidden = on;
+  });
+  // 区块显隐变了，左侧「本页导航」得跟着重建：pageNavSections() 会跳过
+  // display:none 的区块，签名一变 initPageNav() 就重新生成清单。
+  const page = document.getElementById('pageAgents');
+  if(page && page.classList.contains('active')) initPageNav(page);
+}
+
 async function loadAgentsAvailability(){
   try {
     const r = await getJSON('/agents/available');
     if(r && r.enabled === false){
       AGENTS_AVAILABLE = false;
-      const btn = document.getElementById('btnNavAgents');
-      if(btn) btn.style.display = 'none';
+      AGENTS_REMOTE_REASON = r.reason || '';
+      renderAgentsRemoteNotice();
     }
   } catch(e){}
 }
 
 function switchMainTab(tab){
-  // 入口被撤掉后（?tab=agents 的书签、上次停留的页签）退回网关页
-  if(tab === 'agents' && !AGENTS_AVAILABLE) tab = 'gateway';
-  // 被「顶部页签显示」收起来的页面同理：书签与上次停留的页签都不能把内容调出来，
+  // 被「顶部页签显示」收起来的页面：书签与上次停留的页签都不能把内容调出来，
   // 否则页面容器带着 hidden 被点亮，屏幕上一片空白。
   if(pageHidden(tab)) tab = firstVisiblePage();
   // 账号页被合并掉之后（设置里的「账号独立成一个页签」关闭，默认），
@@ -17956,6 +18130,7 @@ function switchMainTab(tab){
   const btnAgents = document.getElementById('btnNavAgents');
   const pageOverview = document.getElementById('pageOverview');
   const btnMedia = document.getElementById('btnNavMedia');
+  const btnStations = document.getElementById('btnNavStations');
   const pageGateway = document.getElementById('pageGateway');
   const pageTasks = document.getElementById('pageTasks');
   const pageAccounts = document.getElementById('pageAccounts');
@@ -17964,12 +18139,14 @@ function switchMainTab(tab){
   const pageSettings = document.getElementById('pageSettings');
   const pageAgents = document.getElementById('pageAgents');
   const pageMedia = document.getElementById('pageMedia');
+  const pageStations = document.getElementById('pageStations');
   const tabs = [
     ['overview', btnOverview, pageOverview],
     ['gateway', btnGateway, pageGateway],
     ['accounts', btnAccounts, pageAccounts],
     ['tasks', btnTasks, pageTasks],
     ['analytics', btnAnalytics, pageAnalytics],
+    ['stations', btnStations, pageStations],
     ['logs', btnLogs, pageLogs],
     ['settings', btnSettings, pageSettings],
     ['agents', btnAgents, pageAgents],
@@ -17994,6 +18171,7 @@ function switchMainTab(tab){
   if(tab === 'accounts' || (!_accountsSeparateTab && tab === 'gateway')){ loadActivityBoard(); }
   if(window.__NEXT_UI__ && !_accountsSeparateTab && tab === 'overview'){ loadActivityBoard(); }
   if(tab === 'analytics'){ loadAnalytics(); loadAnalyticsMatrix(); }
+  if(tab === 'stations'){ loadStations(); }
   if(tab === 'settings'){ loadSettings(); loadProxySlots(); }
   if(tab === 'agents'){ loadAgents(); }
   if(tab === 'media'){ loadMediaPage(); }
@@ -18032,8 +18210,22 @@ async function loadAgents(showToast){
   try {
     const data = await getJSON('/agents');
     AGENTS_DATA = data || {};
+    // 远程看板（服务端 / Docker / OpenWrt）：/agents 只回 enabled:false + reason，
+    // 没有 clients / keys / models。一键写入没有落点，但「其他客户端」里的地址
+    // 照样能复制去手动接入，所以只收起依赖本机的那两块，页面本身留着。
+    if(AGENTS_DATA.enabled === false){
+      AGENTS_AVAILABLE = false;
+      AGENTS_REMOTE_REASON = AGENTS_DATA.reason || AGENTS_REMOTE_REASON;
+      renderAgentsRemoteNotice();
+      renderAgentManualUrls();
+      if(state){ state.textContent = '(远程看板，不提供一键配置)'; state.style.color = 'var(--dim)'; }
+      return;
+    }
     AGENT_MODELS = AGENTS_DATA.models || [];
     AGENT_KEYS = AGENTS_DATA.keys || AGENTS_DATA.api_keys || [];
+    // 正常拿到数据 = 本机可用，把可能残留的远程提示收掉。
+    AGENTS_AVAILABLE = true;
+    renderAgentsRemoteNotice();
     renderAgentConnForm();
     renderAgentCards();
     renderAgentManualUrls();
@@ -21184,6 +21376,7 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
 })();
 </script>
 <script>
+
 /* ── 自定义下拉：运行时渐进增强 ────────────────────────────────────
    把页面里所有原生 <select> 换成同尺寸的自绘下拉，展开层不再由浏览器
    绘制（原生 option 列表无法用 CSS 控制，深色模式下尤其突兀）。
@@ -21878,6 +22071,435 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
   });
   nextSyncChrome(nextCurrentTab() || 'overview');
 })();
+/* ---- 公益站管理模块 ----
+   后端接口（wb_stations.py / wb_proxy.py）：
+     GET  /stations           → {stations:[...]}
+     POST /stations/save      {id?, name, base_url, api_key, enabled} → {station}
+     POST /stations/delete    {id}
+     POST /stations/probe     {id?}   // 无 id 则全部测活
+     POST /stations/models    {id, models:[...]}
+   每个 station: {id, name, base_url, api_key_masked, enabled, models_selected, models_all, status:{state,latency_ms,detail,checked_at}, note}
+   state: ok | no_models | unavailable | unknown
+   这里只用 getJSON/postJSON/toast/esc。 */
+let STATIONS_DATA = [];
+let STATIONS_LOADING = false;
+let STATION_SOLVER = null;
+let _stationsEditModelsTarget = null;   // 当前正在勾选模型的站点 id
+let _stationsModelsAll = [];            // 该站点已发现模型清单
+let _stationsModelsMeta = {};           // 模型 -> 站点自报的能力字段（上下文/输出）
+let _stationsModelsSelected = [];       // 该站点已勾选模型清单
+
+async function loadStations(showToast){
+  if(STATIONS_LOADING) return;
+  STATIONS_LOADING = true;
+  const tbody = document.getElementById('stationsTbody');
+  try {
+    const data = await getJSON('/stations');
+    STATIONS_DATA = data.stations || [];
+    STATION_SOLVER = data.solver || null;
+    renderStations();
+    // 提示行是锦上添花：它出错不该把整个站点列表一起带崩
+    try { renderStationSolver(STATION_SOLVER); } catch(e) { console.warn(e); }
+  } catch(e){
+    if(tbody) tbody.innerHTML = '<tr><td colspan="6" style="color:var(--bad);text-align:center;padding:18px">加载失败：' + esc(e.message) + '</td></tr>';
+    if(showToast) toast('公益站加载失败：' + e.message, 'bad');
+  } finally {
+    STATIONS_LOADING = false;
+  }
+}
+
+// 签到能力提示：告诉用户人机验证站点现在会怎么处理
+//   configured -> 配了打码 key，可全自动
+//   browser    -> 镜像带浏览器，会自动尝试浏览器签到
+//   都不是     -> 点「签到」后弹窗用本机浏览器过验证
+function renderStationSolver(solver){
+  const el = document.getElementById('stationsHint');
+  if(!el) return;
+  const base = '同名模型自动合并；多站共享时按「优先级 + 延迟」选站，失败自动切换。';
+  let extra;
+  if(solver && solver.configured){
+    extra = '｜打码服务已启用（' + (solver.provider || 'capsolver') + '），人机验证站点可全自动签到。';
+  } else if(solver && solver.browser){
+    extra = '｜镜像带浏览器，人机验证站点会自动尝试浏览器签到。';
+  } else {
+    extra = '｜人机验证站点：点「签到」后在弹窗里用本机浏览器过验证即可。';
+  }
+  el.textContent = base + extra;
+}
+
+function stationStateBadge(st){
+  const s = (st.status && st.status.state) || 'unknown';
+  const map = {
+    ok: ['正常', 'var(--ok,#16a34a)'],
+    no_models: ['无模型', 'var(--warn,#d97706)'],
+    key_invalid: ['Key失效', 'var(--bad,#dc2626)'],
+    unavailable: ['不可用', 'var(--bad,#dc2626)'],
+    unknown: ['未测活', 'var(--dim)']
+  };
+  const row = map[s] || map.unknown;
+  const detail = (st.status && st.status.detail) || '';
+  return '<span title="' + esc(detail) + '" style="display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600;color:#fff;background:' + row[1] + '">' + row[0] + '</span>';
+}
+
+function stationLatency(st){
+  const ms = st.status && st.status.latency_ms;
+  if(ms == null) return '<span style="color:var(--dim)">—</span>';
+  const s = ms < 1000 ? ms + ' ms' : (ms/1000).toFixed(1) + ' s';
+  return '<span style="font-variant-numeric:tabular-nums">' + s + '</span>';
+}
+
+// 从站点 API 地址推导站点首页地址：去掉 /v1、/api 等 API 尾部路径，
+// 保留其余子路径（有的站点部署在子目录下），只对无协议的纯域名做兜底。
+function stationHomeHref(baseUrl){
+  let u = String(baseUrl || '').replace(/\/+$/, '');
+  if(!u) return '';
+  try {
+    const p = new URL(u);
+    p.pathname = p.pathname.replace(/\/+(v\d+|\/?api)(\/.*)?$/i, '');
+    return p.origin + p.pathname;
+  } catch(e) {
+    return u.replace(/\/+(v\d+|\/?api)(\/.*)?$/i, '');
+  }
+}
+
+function renderStations(){
+  const tbody = document.getElementById('stationsTbody');
+  if(!tbody) return;
+  if(!STATIONS_DATA.length){
+    tbody.innerHTML = '<tr><td colspan="6" style="color:var(--dim);text-align:center;padding:22px">还没有站点，点击「添加站点」接入第一个公益站。</td></tr>';
+    return;
+  }
+  // 统计每个模型被多少个站勾选，用于提示「多站共享可自动故障转移」
+  const shareCount = {};
+  STATIONS_DATA.forEach(function(s){
+    (s.models_selected || []).forEach(function(m){ shareCount[m] = (shareCount[m] || 0) + 1; });
+  });
+  let html = '';
+  STATIONS_DATA.forEach(function(st){
+    const url = st.base_url || '';
+    const pri = (st.priority != null) ? st.priority : 0;
+    const shared = (st.models_selected || []).filter(function(m){ return shareCount[m] > 1; }).length;
+    // 余额已单独成列，说明里去掉服务端拼的那段，避免重复
+    let note = (st.note || '').replace(/｜余额 [^｜]*/g, '');
+    if(shared > 0){ note += '｜' + shared + ' 个模型多站共享（自动故障转移）'; }
+    // 打开站点用的地址：base_url 是 API 地址（常以 /v1、/api 结尾），
+    // 跳转时去掉这些 API 尾部路径，打开站点首页，避免跳到不存在的 /v1 页面
+    const siteHref = stationHomeHref(url);
+    const nameHtml = siteHref
+      ? '<a href="' + esc(siteHref) + '" target="_blank" rel="noopener noreferrer" '
+        + 'title="在新标签页打开站点，手动完成签到" '
+        + 'style="color:inherit;text-decoration:none;font-weight:600">' + esc(st.name)
+        + ' <span style="font-weight:400;color:var(--dim);font-size:11px">↗</span></a>'
+      : '<span style="font-weight:600">' + esc(st.name) + '</span>';
+    const urlHtml = siteHref
+      ? '<a href="' + esc(siteHref) + '" target="_blank" rel="noopener noreferrer" '
+        + 'style="color:var(--dim);font-size:11px;word-break:break-all;text-decoration:none">' + esc(url) + '</a>'
+      : '<span style="color:var(--dim);font-size:11px;word-break:break-all">' + esc(url) + '</span>';
+    // 出站身份非默认时单独标出来：用户一眼能看出这个站在伪装成哪个客户端
+    const profile = st.client_profile || 'browser';
+    const profileLabel = (PROFILE_LABELS[profile] || '') ;
+    const profileHtml = (profile && profile !== 'browser' && profileLabel)
+      ? ' <span title="转发到该站时伪装成该客户端" style="font-weight:400;color:var(--accent,#4f8cff);font-size:11px;border:1px solid currentColor;border-radius:4px;padding:0 4px">' + esc(profileLabel) + '</span>'
+      : '';
+    html += '<tr>' +
+      '<td><div>' + nameHtml + profileHtml +
+          ' <span style="font-weight:400;color:var(--dim);font-size:11px">优先级 ' + pri + '</span></div>' +
+          '<div>' + urlHtml + '</div>' +
+          (st.enabled ? '' : '<span style="color:var(--warn,#d97706);font-size:11px">（已停用）</span>') + '</td>' +
+      '<td>' + stationStateBadge(st) + '</td>' +
+      '<td>' + stationLatency(st) + '</td>' +
+      '<td>' + stationBalanceCell(st) + '</td>' +
+      '<td style="max-width:300px">' + esc(note) + '</td>' +
+      '<td><div style="display:flex;gap:6px;flex-wrap:wrap">' +
+        '<a class="sec mini" href="' + esc(siteHref || '#') + '" target="_blank" rel="noopener noreferrer" '
+          + 'style="text-decoration:none;display:inline-flex;align-items:center">打开站点</a>' +
+        '<button class="sec mini" onclick="probeStation(\'' + st.id + '\')">测活</button>' +
+        '<button class="sec mini" onclick="detectStationClient(\'' + st.id + '\')" '
+          + 'title="逐个试浏览器/Codex/Claude 等身份，找出该站放行的那一个">检测客户端</button>' +
+        '<button class="sec mini" onclick="openStationModels(\'' + st.id + '\')">选模型</button>' +
+        '<button class="sec mini" onclick="fetchStationBalance(\'' + st.id + '\')">余额</button>' +
+        '<button class="sec mini" onclick="openStationEdit(\'' + st.id + '\')">编辑</button>' +
+        '<button class="sec mini danger" onclick="deleteStation(\'' + st.id + '\')">删除</button>' +
+      '</div></td>' +
+      '</tr>';
+  });
+  tbody.innerHTML = html;
+}
+
+// 余额单元格：站点 /api/user/self 的整数配额按站点的 quota_per_unit 换算，
+// 服务端已经算好 display（本位币）与 display_alt（另一种货币），这里只负责显示。
+function stationBalanceCell(st){
+  const b = st.balance || {};
+  if(b.error){
+    return '<span style="color:var(--bad,#dc2626);font-size:11px" title="' + esc(b.error) + '">查询失败</span>';
+  }
+  if(!b.display){
+    return '<span style="color:var(--dim)">—</span>';
+  }
+  let html = '<div style="font-weight:600;font-variant-numeric:tabular-nums">' + esc(b.display) + '</div>';
+  const alt = b.display_alt ? esc(b.display_alt) : '';
+  const used = (b.used_usd != null && Number(b.used_usd) > 0)
+    ? '已用 $' + Number(b.used_usd).toFixed(2) : '';
+  const sub = [alt, used].filter(Boolean).join(' · ');
+  if(sub) html += '<div style="color:var(--dim);font-size:11px">' + sub + '</div>';
+  return html;
+}
+
+function stationById(id){
+  for(let i=0;i<STATIONS_DATA.length;i++){ if(STATIONS_DATA[i].id === id) return STATIONS_DATA[i]; }
+  return null;
+}
+
+// 出站身份显示名（与后端 wb_stations._CLIENT_PROFILES 一一对应）
+const PROFILE_LABELS = {
+  browser: '浏览器',
+  codex: 'Codex',
+  claude: 'Claude Code',
+  vscode: 'VS Code',
+  cli: 'CLI',
+  wb: 'WorkBuddy'
+};
+
+function closeClientDetect(){
+  document.getElementById('clientDetectModal').classList.remove('show');
+}
+
+function _clientDetectRow(profile, status, ok, detail){
+  const label = PROFILE_LABELS[profile] || profile;
+  const mark = ok
+    ? '<span style="color:var(--ok,#16a34a);font-weight:600">可用</span>'
+    : '<span style="color:var(--bad,#dc2626)">不可用</span>';
+  const code = status ? ('HTTP ' + status) : '连接失败';
+  return '<tr><td style="padding:6px 8px;font-weight:600">' + esc(label) + '</td>'
+    + '<td style="padding:6px 8px">' + mark + '</td>'
+    + '<td style="padding:6px 8px;color:var(--dim);font-size:11px">' + esc(code)
+    + (detail ? '｜' + esc(String(detail).slice(0, 90)) : '') + '</td></tr>';
+}
+
+async function detectStationClient(id){
+  const st = stationById(id);
+  const name = st ? st.name : '该站点';
+  const body = document.getElementById('clientDetectBody');
+  document.getElementById('clientDetectTitle').textContent = '检测客户端：' + name;
+  body.innerHTML = '<div style="color:var(--dim);font-size:13px">正在逐个身份试一次极短请求'
+    + '（每种约 1 token），最多试 5 种，请稍候…</div>';
+  document.getElementById('clientDetectModal').classList.add('show');
+  try {
+    const r = await postJSON('/stations/detect-client', { id: id, save: true });
+    let html = '';
+    if(r && r.ok){
+      const label = PROFILE_LABELS[r.profile] || r.profile;
+      html += '<div style="margin-bottom:10px;font-size:13px;color:var(--ok,#16a34a)">'
+        + '该站接受「' + esc(label) + '」，已自动写回该站点的出站身份。</div>';
+      if(r.model){
+        html += '<div style="margin-bottom:10px;color:var(--dim);font-size:11px">'
+          + '测试模型：' + esc(r.model) + '</div>';
+      }
+      await loadStations();
+    } else {
+      html += '<div style="margin-bottom:10px;font-size:13px;color:var(--bad,#dc2626)">'
+        + '所有身份都没通' + (r && r.error ? '：' + esc(r.error) : '') + '</div>';
+      if(r && r.tried && r.tried.length){
+        html += '<div style="margin-bottom:10px;color:var(--dim);font-size:11px">'
+          + '如果每个都返回 401/403 且提示 Key 无效，问题在站点 Key 而不是客户端身份。</div>';
+      }
+    }
+    const tried = (r && r.tried) || [];
+    if(tried.length){
+      html += '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+        + '<thead><tr style="color:var(--dim);text-align:left">'
+        + '<th style="padding:4px 8px">身份</th><th style="padding:4px 8px">结果</th>'
+        + '<th style="padding:4px 8px">说明</th></tr></thead><tbody>';
+      tried.forEach(function(t){
+        html += _clientDetectRow(t.profile, t.status, t.ok, t.detail);
+      });
+      html += '</tbody></table>';
+    }
+    body.innerHTML = html;
+  } catch(e){
+    body.innerHTML = '<div style="color:var(--bad,#dc2626);font-size:13px">检测失败：'
+      + esc(e.message || String(e)) + '</div>';
+  }
+}
+
+function openStationEdit(id){
+  const st = id ? stationById(id) : null;
+  document.getElementById('stationEditId').value = id || '';
+  document.getElementById('stationEditTitle').textContent = st ? '编辑站点' : '添加站点';
+  document.getElementById('stationEditName').value = st ? (st.name || '') : '';
+  document.getElementById('stationEditUrl').value = st ? (st.base_url || '') : '';
+  document.getElementById('stationEditKey').value = '';
+  document.getElementById('stationEditPriority').value = st ? (st.priority != null ? st.priority : 0) : 0;
+  document.getElementById('stationEditClient').value = (st && st.client_profile) || 'browser';
+  document.getElementById('stationEditEnabled').checked = st ? !!st.enabled : true;
+  document.getElementById('stationEditModal').classList.add('show');
+}
+function closeStationEdit(){
+  document.getElementById('stationEditModal').classList.remove('show');
+}
+
+async function saveStation(){
+  const id = document.getElementById('stationEditId').value;
+  const name = document.getElementById('stationEditName').value.trim();
+  const url = document.getElementById('stationEditUrl').value.trim();
+  const key = document.getElementById('stationEditKey').value.trim();
+  const priority = parseInt(document.getElementById('stationEditPriority').value, 10);
+  const clientProfile = document.getElementById('stationEditClient').value;
+  const enabled = document.getElementById('stationEditEnabled').checked;
+  if(!name || !url){ toast('站点名称和接口地址不能为空', 'bad'); return; }
+  try {
+    const body = { id: id, name: name, base_url: url, enabled: enabled,
+                   client_profile: clientProfile };
+    if(key) body.api_key = key;
+    if(!isNaN(priority)) body.priority = priority;
+    await postJSON('/stations/save', body);
+    closeStationEdit();
+    toast('已保存，正在测活…', 'ok');
+    await loadStations();
+    // 测活是后台线程，稍后自动刷新一次
+    setTimeout(function(){ loadStations(); }, 2500);
+  } catch(e){
+    toast('保存失败：' + e.message, 'bad');
+  }
+}
+
+async function deleteStation(id){
+  const st = stationById(id);
+  if(!confirm('确定删除站点「' + (st ? st.name : id) + '」吗？')) return;
+  try {
+    await postJSON('/stations/delete', { id: id });
+    toast('已删除', 'ok');
+    await loadStations();
+  } catch(e){
+    toast('删除失败：' + e.message, 'bad');
+  }
+}
+
+async function probeStation(id){
+  const st = stationById(id);
+  const btn = event && event.currentTarget;
+  if(btn){ btn.disabled = true; btn.textContent = '测活中…'; }
+  try {
+    const r = await postJSON('/stations/probe', { id: id });
+    await loadStations();
+    const s = r.station && r.station.status;
+    if(s && s.state === 'ok') toast('测活通过：' + (s.latency_ms != null ? s.latency_ms + ' ms' : ''), 'ok');
+    else toast('测活完成：' + (s ? s.state : ''), (s && s.state === 'ok') ? 'ok' : 'bad');
+  } catch(e){
+    toast('测活失败：' + e.message, 'bad');
+    await loadStations();
+  } finally {
+    if(btn){ btn.disabled = false; btn.textContent = '测活'; }
+  }
+}
+
+async function probeStationsAll(){
+  try {
+    await postJSON('/stations/probe', {});
+    toast('已开始全部测活，稍后自动刷新', 'ok');
+    setTimeout(function(){ loadStations(); }, 3000);
+    setTimeout(function(){ loadStations(); }, 6000);
+  } catch(e){
+    toast('测活失败：' + e.message, 'bad');
+  }
+}
+
+async function fetchStationBalance(id){
+  const st = stationById(id);
+  const btn = event && event.currentTarget;
+  if(btn){ btn.disabled = true; btn.textContent = '查询中…'; }
+  try {
+    const r = await postJSON('/stations/balance', { id: id });
+    if(r.ok && r.balance){
+      const b = r.balance;
+      if(b.error){ toast((st ? st.name : '站点') + ' 余额查询失败：' + b.error, 'bad'); }
+      else {
+        let msg = (st ? st.name : '站点');
+        if(b.username) msg += '（' + b.username + '）';
+        // 服务端已按站点 quota_per_unit 换算：display 是站点本位币
+        msg += ' 剩余 ' + (b.display || '未知');
+        if(b.display_alt) msg += ' / ' + b.display_alt;
+        if(b.used_usd != null && Number(b.used_usd) > 0){
+          msg += '，已用 $' + Number(b.used_usd).toFixed(2);
+        }
+        toast(msg, 'ok');
+      }
+    } else {
+      toast('未取到余额（可能该站不支持 /api/user/self，或令牌未通过校验）', 'bad');
+    }
+    await loadStations();
+  } catch(e){
+    toast('余额查询失败：' + e.message, 'bad');
+  } finally {
+    if(btn){ btn.disabled = false; btn.textContent = '余额'; }
+  }
+}
+
+function openStationModels(id){
+  const st = stationById(id);
+  if(!st) return;
+  _stationsEditModelsTarget = id;
+  _stationsModelsAll = st.models_all || [];
+  _stationsModelsSelected = (st.models_selected || []).slice();
+  _stationsModelsMeta = st.models_meta || {};
+  document.getElementById('stationModelsMeta').textContent = st.name;
+  renderStationModels();
+  document.getElementById('stationModelsModal').classList.add('show');
+}
+function closeStationModels(){
+  document.getElementById('stationModelsModal').classList.remove('show');
+}
+function stationFmtK(v){
+  const n = Number(v || 0);
+  if(!n) return '';
+  const k = Math.round(n / 1000);
+  return k >= 1000 ? (k / 1000) + 'M' : k + 'K';
+}
+function renderStationModels(){
+  const box = document.getElementById('stationModelsList');
+  const hint = document.getElementById('stationModelsHint');
+  if(!_stationsModelsAll.length){
+    box.innerHTML = '<span style="color:var(--dim)">该站点尚未发现模型，请先「测活」。</span>';
+    return;
+  }
+  let html = '';
+  _stationsModelsAll.forEach(function(m){
+    const on = _stationsModelsSelected.indexOf(m) >= 0;
+    // 站点自报的上下文 / 最大输出（没有就留空，不编造）
+    const meta = _stationsModelsMeta[m] || {};
+    const parts = [];
+    const ctx = stationFmtK(meta.context_length);
+    const out = stationFmtK(meta.max_output_tokens);
+    if(ctx) parts.push(ctx);
+    if(out) parts.push('输出 ' + out);
+    const cap = parts.length
+      ? ' <span style="color:var(--dim);font-size:11px">· ' + parts.join(' / ') + '</span>' : '';
+    html += '<label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;min-width:180px">' +
+      '<input type="checkbox" data-m="' + esc(m) + '" ' + (on ? 'checked' : '') + ' style="margin:0">' +
+      '<span style="word-break:break-all">' + esc(m) + cap + '</span></label>';
+  });
+  box.innerHTML = html;
+  if(hint) hint.textContent = '已选 ' + _stationsModelsSelected.length + ' / ' + _stationsModelsAll.length +
+    ' 个模型。上下文/输出为站点上报值；站点没报的，网关模型清单里按模型族共识值补齐。';
+}
+function stationModelsToggle(on){
+  const box = document.getElementById('stationModelsList');
+  box.querySelectorAll('input[data-m]').forEach(function(cb){ cb.checked = on; });
+}
+async function saveStationModels(){
+  const box = document.getElementById('stationModelsList');
+  const picked = [];
+  box.querySelectorAll('input[data-m]').forEach(function(cb){ if(cb.checked) picked.push(cb.getAttribute('data-m')); });
+  try {
+    await postJSON('/stations/models', { id: _stationsEditModelsTarget, models: picked });
+    closeStationModels();
+    toast('已保存勾选，共 ' + picked.length + ' 个模型', 'ok');
+    await loadStations();
+  } catch(e){
+    toast('保存失败：' + e.message, 'bad');
+  }
+}
+
 </script>
 </body>
 </html>

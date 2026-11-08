@@ -53,6 +53,7 @@ wb_accounts.py
 wb_activity.py
 wb_agents.py
 wb_atrest.py
+wb_browser.py
 wb_catalog.py
 wb_codearts.py
 wb_codearts_crypto.py
@@ -72,6 +73,8 @@ wb_proxy.py
 wb_quota_scan.py
 wb_scheduler.py
 wb_settings.py
+wb_solver.py
+wb_stations.py
 wb_tasks.py
 wb_usage_io.py
 wb_tiers.py
