@@ -42,13 +42,13 @@ const NAV = [
   ['btnNavTasks', 'tasks', null],
 ];
 const navButtons = [...html.matchAll(/<button class="main-nav-btn[^"]*" id="(btnNav\w+)"[^>]*>/g)].map(m => m[1]);
-const EXPECTED = ['btnNavGateway', 'btnNavAccounts', 'btnNavTasks', 'btnNavMedia', 'btnNavAnalytics',
-                  'btnNavLogs', 'btnNavAgents', 'btnNavSettings'];
+const EXPECTED = ['btnNavGateway', 'btnNavAccounts', 'btnNavTasks', 'btnNavStations', 'btnNavMedia',
+                  'btnNavAnalytics', 'btnNavLogs', 'btnNavAgents', 'btnNavSettings'];
 check(JSON.stringify(navButtons) === JSON.stringify(EXPECTED),
-  '左侧菜单里的主导航按钮应当就是原来那七个且顺序不变，实得 ' + navButtons.join(','));
+  '左侧菜单里的主导航按钮应当顺序不变（含公益站），实得 ' + navButtons.join(','));
 
 // 每个按钮仍指向原来的页面。
-['gateway', 'accounts', 'tasks', 'media', 'analytics', 'agents', 'settings', 'logs'].forEach(key => {
+['gateway', 'accounts', 'tasks', 'stations', 'media', 'analytics', 'agents', 'settings', 'logs'].forEach(key => {
   const id = 'btnNav' + key.charAt(0).toUpperCase() + key.slice(1);
   check(new RegExp('id="' + id + '"[^>]*onclick="switchMainTab\\(\'' + key + '\'\\)"').test(html),
     id + ' 应当仍然切到 ' + key + ' 页');
@@ -93,8 +93,8 @@ const mainTabs = html.match(/const MAIN_TABS = \[([^\]]*)\];/);
 const names = s => s.split(',').map(x => x.trim().replace(/['"]/g, '')).filter(Boolean);
 check(headTabs && mainTabs && JSON.stringify(names(headTabs[1])) === JSON.stringify(names(mainTabs[1])),
   'head 的 TABS 与主脚本的 MAIN_TABS 必须一致');
-check(names(mainTabs[1]).length === 9 && names(mainTabs[1]).includes('overview') && names(mainTabs[1]).includes('media') && !names(mainTabs[1]).includes('models'),
-  '主页面清单包含新导航总览和媒体页且不含内容入口');
+check(names(mainTabs[1]).length === 10 && names(mainTabs[1]).includes('overview') && names(mainTabs[1]).includes('media') && names(mainTabs[1]).includes('stations') && !names(mainTabs[1]).includes('models'),
+  '主页面清单包含新导航总览、媒体与公益站页且不含内容入口');
 
 // 侧栏折叠与手机抽屉的入口都在。
 check(/function toggleConsoleCollapse\(\)/.test(script), '缺少侧栏折叠');

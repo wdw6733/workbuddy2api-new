@@ -1989,7 +1989,7 @@ if(!window.__NEXT_UI__ && defaultConsoleLayout) {
   };
 
   // 3. Tab 初始化（与下方主脚本的 MAIN_TABS 保持一致）
-  var TABS = ['overview','gateway','accounts','tasks','media','analytics','agents','settings','logs'];
+  var TABS = ['overview','gateway','accounts','tasks','media','analytics','stations','agents','settings','logs'];
   var fallback = window.__NEXT_UI__ ? 'overview' : 'gateway';
   var pick = null;
   try {
@@ -5277,6 +5277,10 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="5" y="7" width="14" height="11" rx="3"/><path d="M9 7V5.5A2.5 2.5 0 0 1 11.5 3h1A2.5 2.5 0 0 1 15 5.5V7M9 12h.01M15 12h.01M9.5 15.5h5"/></svg>
         <span>智能体</span>
       </button>
+      <button type="button" class="next-nav-item" data-next-tab="stations" onclick="nextGo('stations')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="5" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><path d="M12 7v4M12 11l-5.5 5M12 11l5.5 5"/></svg>
+        <span>公益站</span>
+      </button>
       <button type="button" class="next-nav-item" data-next-tab="media" onclick="nextGo('media')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M8 5l2 5h4l2-5M10 14l2 2 2-2"/></svg>
         <span>媒体</span>
@@ -7591,6 +7595,10 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
       <button type="button" class="next-more-item" data-next-tab="agents" onclick="nextGo('agents')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="5" y="7" width="14" height="11" rx="3"/><path d="M9 7V5.5A2.5 2.5 0 0 1 11.5 3h1A2.5 2.5 0 0 1 15 5.5V7M9 12h.01M15 12h.01M9.5 15.5h5"/></svg>
         <span>智能体</span>
+      </button>
+      <button type="button" class="next-more-item" data-next-tab="stations" onclick="nextGo('stations')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="5" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><path d="M12 7v4M12 11l-5.5 5M12 11l5.5 5"/></svg>
+        <span>公益站</span>
       </button>
       <button type="button" class="next-more-item" data-next-tab="media" onclick="nextGo('media')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M8 5l2 5h4l2-5M10 14l2 2 2-2"/></svg>
@@ -13472,7 +13480,7 @@ function generatePageList(current, total){
 
 // Tab ids in nav order. One list so the restore path and the nav cannot
 // drift apart.
-const MAIN_TABS = ['overview', 'gateway', 'accounts', 'tasks', 'media', 'analytics', 'agents', 'settings', 'logs'];
+const MAIN_TABS = ['overview', 'gateway', 'accounts', 'tasks', 'media', 'analytics', 'stations', 'agents', 'settings', 'logs'];
 const MAIN_TAB_STORE = 'wb-proxy-main-tab';
 let currentMainTab = 'gateway';
 let analyticsRange = 'today';
@@ -14147,7 +14155,7 @@ function navPageLabel(row){
   if(window.__NEXT_UI__){
     const nextLabels = {
       gateway: '网关', accounts: '账号', tasks: '自动化', analytics: '用量',
-      agents: '智能体', settings: '设置', logs: '日志'
+      stations: '公益站', agents: '智能体', settings: '设置', logs: '日志'
     };
     if(nextLabels[row.key]) return nextLabels[row.key];
   }
@@ -21689,7 +21697,7 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
   'use strict';
 
   var NEXT = !!window.__NEXT_UI__;
-  var MORE_TABS = ['tasks', 'agents', 'media', 'settings', 'logs'];
+  var MORE_TABS = ['tasks', 'agents', 'stations', 'media', 'settings', 'logs'];
 
   function nextCurrentTab(){
     var page = document.querySelector('.main-page.active');
@@ -21702,6 +21710,7 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
     if(id === 'pageAnalytics') return 'analytics';
     if(id === 'pageAgents') return 'agents';
     if(id === 'pageMedia') return 'media';
+    if(id === 'pageStations') return 'stations';
     if(id === 'pageSettings') return 'settings';
     if(id === 'pageLogs') return 'logs';
     return '';
@@ -21721,6 +21730,7 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
     analytics: { title: '用量', desc: 'Token、请求、缓存、成本和剩余额度。' },
     tasks: { title: '自动化', desc: '每日活跃、成长任务和后台调度器。' },
     agents: { title: '智能体', desc: '把本机 AI 客户端一键指向当前网关。' },
+    stations: { title: '公益站', desc: '接入 OpenAI 兼容的第三方公益站，测活、勾选模型后直接调用。' },
     media: { title: '媒体', desc: '图片与视频生成任务、额度、价格和账号分配。' },
     settings: { title: '设置', desc: 'API Key、出口、模型、调度和系统选项。' },
     logs: { title: '日志', desc: '实时运行日志、筛选、导出和落库状态。' }
@@ -21754,7 +21764,7 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
     try {
       if(typeof _hiddenPages !== 'undefined' && Array.isArray(_hiddenPages)) hidden = _hiddenPages;
     } catch(e){}
-    var order = ['overview', 'gateway', 'accounts', 'analytics', 'tasks', 'agents', 'media', 'settings', 'logs'];
+    var order = ['overview', 'gateway', 'accounts', 'analytics', 'tasks', 'agents', 'stations', 'media', 'settings', 'logs'];
     var firstVisible = '';
     order.forEach(function(key){
       var off = hidden.indexOf(key) >= 0;
