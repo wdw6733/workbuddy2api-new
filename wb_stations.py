@@ -509,18 +509,52 @@ def _probe_key_invalid(st):
                 body = _read_body(resp, 256 * 1024)
                 status = getattr(resp, "status", 200)
         except urllib.error.HTTPError as exc:
+            body = ""
             try:
-                exc.read(200)
+                body = _read_body(exc, 64 * 1024)
             except Exception:
                 pass
             if exc.code in (401, 403):
-                return "API Key 已失效（HTTP %d），请编辑站点更新" % exc.code
+                msg = _error_message(body)
+                return ("API Key 已失效（HTTP %d%s），请编辑站点更新"
+                        % (exc.code, "：" + msg if msg else ""))
             return None
         if _auth_failed(status, body):
             return "API Key 已失效，请编辑站点更新"
         return None
     except Exception:
         return None
+
+
+def _error_message(body, max_len=140):
+    """从 New API / OpenAI 兼容的错误响应里抽出一句可读的 message。
+
+    各家写法不一，常见：
+      {"error": {"message": "...", "type": "new_api_error"}}
+      {"message": "...", "success": false}
+      {"code": "...", "message": "..."}
+    拿不到就返回 ""。
+    """
+    text = (body or "").strip()
+    if not text:
+        return ""
+    try:
+        data = json.loads(text)
+    except Exception:
+        # 非 JSON：截一段纯文本兜底
+        return text[:max_len]
+    if not isinstance(data, dict):
+        return ""
+    err = data.get("error")
+    if isinstance(err, dict):
+        msg = err.get("message")
+        if isinstance(msg, str) and msg.strip():
+            return msg.strip()[:max_len]
+    for key in ("message", "msg", "detail", "error"):
+        val = data.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()[:max_len]
+    return ""
 
 
 def _probe_once(st):
@@ -556,11 +590,16 @@ def _probe_once(st):
             return ("ok", latency, "", models, meta_map)
     except urllib.error.HTTPError as exc:
         latency = int((time.time() - t0) * 1000)
+        body = ""
         try:
-            exc.read(200)
+            body = _read_body(exc, 64 * 1024)
         except Exception:
             pass
-        return ("unavailable", latency, "HTTP %d" % exc.code, [], {})
+        detail = "HTTP %d" % exc.code
+        msg = _error_message(body)
+        if msg:
+            detail += "：%s" % msg
+        return ("unavailable", latency, detail, [], {})
     except urllib.error.URLError as exc:
         latency = int((time.time() - t0) * 1000)
         reason = getattr(exc, "reason", exc)
@@ -1366,10 +1405,18 @@ def fetch_balance(st_id):
         _logmsg("stations   : 余额 %s -> %s" % (snap.get("name"), balance.get("display")))
         return (True, balance)
     except Exception as exc:
+        err = str(exc)[:120]
+        if isinstance(exc, urllib.error.HTTPError):
+            try:
+                ebody = _read_body(exc, 64 * 1024)
+            except Exception:
+                ebody = ""
+            msg = _error_message(ebody)
+            err = ("HTTP %d" % exc.code) + ("：%s" % msg if msg else "")
         with _LOCK:
             st = _find(st_id)
             if st:
-                st["balance"] = {"checked_at": time.time(), "error": str(exc)[:120]}
+                st["balance"] = {"checked_at": time.time(), "error": err}
                 save()
         return (False, None)
 
