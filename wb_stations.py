@@ -491,14 +491,20 @@ def _model_meta_from_item(it):
 def _probe_key_invalid(st):
     """probe 主请求通过后，补一次凭据有效性校验。
 
-    /v1/models 在多数 New API / One API 站点不校验 API Key（匿名也能拉清单），
-    「测活正常」不代表 Key 还有效——等客户端发 chat 时才由上游 401 背刺，
-    用户看到的是「API Key 无效或者没有权限访问该模型」，完全对不上号。
-    这里补打一次 /api/user/self（标准用户接口，必须有效凭据）：
+    /api/user/self 是 New API 系的管理端点，只认 access token（checkin_token /
+    session cookie），不认 sk- 开头的 API Key。只有 API Key 的站点拿 sk- 去打
+    它必然回 Unauthorized / invalid access token，把「Key 有效但没配 access
+    token」误判成「Key 失效」（星见雅这类站就是踩这个坑）。
+    所以补打只在站点配了 access token 类凭据时才做；只有 API Key 的站点靠
+    主请求 /v1/models 兜底——New API 系对 /v1/models 同样校验 Key，主请求
+    通过即 Key 有效。
+
+    补打结果：
       401/403 或 success:false 的鉴错 -> 返回失效说明（面板标 key_invalid）
       404（站点没这个端点）/ 网络错误   -> 返回 None，不误判
     """
-    if not str(st.get("api_key") or "").strip():
+    if not (str(st.get("checkin_token") or "").strip() or
+            str(st.get("session_cookie") or "").strip()):
         return None
     try:
         req = urllib.request.Request(_balance_url(st),

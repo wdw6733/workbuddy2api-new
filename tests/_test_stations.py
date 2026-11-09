@@ -339,14 +339,15 @@ class CheckinRequestTests(unittest.TestCase):
 
 # ---- 站点 id ---------------------------------------------------------
 
-# ---- probe 的 Key 校验：/v1/models 不校验 Key，测活正常 ≠ Key 有效 ----
+# ---- probe 的 Key 校验：只有 access token 类凭据才补打 /api/user/self ----
 
 class ProbeKeyTests(unittest.TestCase):
-    """公益站面板去登录/签到后，「测活」仍要能发现站点 Key 失效。
+    """站点配了 access token（checkin_token / session cookie）时，「测活」补打
+    一次 /api/user/self 才能识别凭据失效；失效时 state=key_invalid，面板显示
+    「Key失效」，而不是等客户端发 chat 被上游 401 背刺。
 
-    /v1/models 在多数 New API / One API 站点匿名可访问，主探测通过不代表
-    Key 有效；补打一次 /api/user/self 才能识别。失效时 state=key_invalid，
-    面板显示「Key失效」，而不是等客户端发 chat 被上游 401 背刺。
+    只有 API Key（sk-）的站点不补打：/api/user/self 是管理端点、不认 sk- Key，
+    拿 sk- 去打必然回 Unauthorized，会误判「Key 失效」（星见雅这类站踩过坑）。
     """
 
     def setUp(self):
@@ -367,8 +368,10 @@ class ProbeKeyTests(unittest.TestCase):
             return FakeResponse({"data": {}})
         return fake_urlopen
 
-    def _probe_state(self, user_self):
+    def _probe_state(self, user_self, checkin_token="eyJ.test.access"):
         sid = add()
+        if checkin_token:
+            wb_stations.update_station(sid, checkin_token=checkin_token)
         with mock.patch.object(wb_stations.urllib.request, "urlopen",
                                self._urlopen_for(user_self)):
             st = wb_stations.probe(sid)
@@ -392,6 +395,15 @@ class ProbeKeyTests(unittest.TestCase):
         status, _ = self._probe_state(
             {"success": False, "message": "无权进行此操作，access token 无效"})
         self.assertEqual(status["state"], "key_invalid")
+
+    def test_api_key_only_does_not_judge_user_self(self):
+        # 只有 API Key（无 access token）时，user/self 回 Unauthorized 也
+        # 不能误判：主请求 /v1/models 已校验 Key，state 应保持 ok
+        status, st = self._probe_state(
+            {"success": False, "message": "Unauthorized, invalid access token"},
+            checkin_token="")
+        self.assertEqual(status["state"], "ok")
+        self.assertEqual(st["models_all"], ["gpt-6-astra"])
 
     def test_missing_user_endpoint_does_not_judge(self):
         # 404：站点没有 /api/user/self 这个用户接口，不能误判成 Key 失效
